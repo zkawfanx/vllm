@@ -7,6 +7,48 @@ import torch
 from vllm.v1.attention.ops.xpu_mla_sparse import triton_bf16_mla_sparse_interface
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("num_tokens", [1, 6, 17])
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_dsv41_ampere_real_heads_match_flashmla_padding(num_tokens, with_sink):
+    """The TP8 Ampere path keeps eight heads without changing real-head output."""
+    from vllm.models.deepseek_v4_1.ampere.ampere_sparse import (
+        DeepseekV41AmpereMLAAttention,
+    )
+    from vllm.models.deepseek_v4_1.ampere.sparse_attn import ampere_sparse_attn
+    from vllm.models.deepseek_v4_1.nvidia.flashmla import DeepseekV4FlashMLAAttention
+
+    torch.manual_seed(42)
+    heads = DeepseekV41AmpereMLAAttention.get_padded_num_q_heads(8)
+    assert heads == 8
+    padded_heads = DeepseekV4FlashMLAAttention.get_padded_num_q_heads(8)
+    assert padded_heads == 64
+    q = torch.randn(num_tokens, heads, 512, dtype=torch.bfloat16, device="cuda")
+    padded_q = torch.nn.functional.pad(q, (0, 0, 0, padded_heads - heads))
+    kv = torch.randn(256, 1, 512, dtype=q.dtype, device=q.device)
+    indices = torch.randint(
+        0, 256, (num_tokens, 1, 128), device=q.device, dtype=torch.int32
+    )
+    indices[:, :, :16] = -1
+    if num_tokens > 1:
+        indices[-1] = -1
+    sink = torch.randn(heads, device=q.device) if with_sink else None
+    padded_sink = (
+        torch.nn.functional.pad(sink, (0, padded_heads - heads), value=-float("inf"))
+        if sink is not None
+        else None
+    )
+    scale = 512**-0.5
+    actual = ampere_sparse_attn(q, kv, indices, scale, sink)
+    padded = ampere_sparse_attn(padded_q, kv, indices, scale, padded_sink)
+    reference, _, _, _ = reference_mla_sparse_prefill(
+        q, kv, indices, scale, 512, attn_sink=sink
+    )
+    assert actual.isfinite().all()
+    torch.testing.assert_close(actual, padded[:, :heads], rtol=0, atol=0)
+    torch.testing.assert_close(actual, reference, rtol=1e-2, atol=1e-2)
+
+
 # https://github.com/deepseek-ai/FlashMLA/blob/main/tests/ref.py#L7
 def _merge_two_lse(
     lse0: torch.Tensor, lse1: torch.Tensor | None, s_q: int, h_q: int
