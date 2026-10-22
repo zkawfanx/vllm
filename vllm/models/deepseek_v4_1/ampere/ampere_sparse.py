@@ -38,6 +38,11 @@ class DeepseekV41AmpereMLAAttention(DeepseekV4FlashMLAAttention):
 
     backend_cls = DeepseekV41AmpereMLASparseBackend
 
+    @classmethod
+    def get_padded_num_q_heads(cls, num_heads: int) -> int:
+        # Fused Q/RoPE insertion has compiled widths starting at eight heads.
+        return max(8, num_heads)
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         # The base class computes this metadata for CUDA FlashMLA. The Ampere
