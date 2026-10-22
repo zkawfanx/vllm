@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -8,10 +9,42 @@ import torch
 
 import vllm.model_executor.layers.sparse_attn_indexer as sparse_indexer
 from vllm.config import CUDAGraphMode
+from vllm.platforms import current_platform
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 
 INDEXER_LAYER = "model.layers.0.self_attn.indexer.k_cache"
 MLA_LAYER = "model.layers.0.self_attn.attn"
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() and os.environ.get("TRITON_INTERPRET") != "1",
+    reason="CUDA or Triton interpreter required",
+)
+def test_candidate_store_preserves_nan_indices_and_padding():
+    """Only -inf scores denote padding; NaNs retain their candidate index."""
+    from vllm.model_executor.kernels.attention.dsa.candidate_blocks import (
+        _store_candidates_kernel,
+    )
+
+    device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+    values = torch.tensor([[1.25, float("nan"), -float("inf"), -2.0]], device=device)
+    indices = torch.tensor([[7, 11, 13, 17]], device=device)
+    storage = torch.full((1, 12), -99, dtype=torch.int32, device=device)
+    output = storage[:, ::2]
+
+    _store_candidates_kernel[(1, 1)](
+        values,
+        indices,
+        output,
+        *output.stride(),
+        values.shape[1],
+        OUT_K=output.shape[1],
+        TILE=256,
+    )
+
+    expected = torch.tensor([[7, 11, -1, 17, -1, -1]], dtype=torch.int32, device=device)
+    torch.testing.assert_close(output, expected)
+    assert torch.all(storage[:, 1::2] == -99)
 
 
 def make_indexer_metadata(
