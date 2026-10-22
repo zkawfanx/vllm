@@ -1,11 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import pytest
 import torch
 
-from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+    KVCacheTensor,
+    KVQuantMode,
+    MLAAttentionSpec,
+    UniformTypeKVCacheSpecs,
+)
 from vllm.v1.worker.gpu.attn_utils import _reshape_kv_cache
-from vllm.v1.worker.utils import AttentionGroup
+from vllm.v1.worker.utils import AttentionGroup, prepare_kernel_block_sizes
 
 
 class FakeFlashAttentionBackend:
@@ -240,3 +249,79 @@ def test_reshape_padded_quantized_kv_cache_preserves_scale_stride():
     assert kv_cache.stride(0) == spec.page_size_bytes
     assert kv_cache.stride(1) == 16 * 1 * 8
     assert kv_cache[1, 1].storage_offset() == spec.page_size_bytes + 16 * 1 * 8
+
+
+@pytest.mark.parametrize("block_size", [128, 256])
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+def test_reshape_deepseek_v41_sm80_packed_cache_preserves_pages(
+    monkeypatch, block_size, compress_ratio
+):
+    """MLA and indexer views must retain physical block IDs and disjoint pages."""
+    from vllm.models.deepseek_v4_1.sparse_mla import DeepseekV4FlashMLABackend
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.backends.mla.indexer import DeepseekV41IndexerBackend
+
+    monkeypatch.setattr(
+        current_platform, "is_device_capability_family", lambda family: family == 80
+    )
+    specs = {
+        name: MLAAttentionSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=512 if name == "mla" else 132,
+            dtype=torch.uint8,
+            tokens_per_state=compress_ratio,
+            cache_dtype_str="fp8_ds_mla" if name == "mla" else None,
+            model_version="deepseek_v4" if name == "mla" else None,
+            kv_quant_mode=(
+                KVQuantMode.FP8_PER_TENSOR if name == "mla" else KVQuantMode.NONE
+            ),
+            alignment=576,
+        )
+        for name in ("mla", "indexer")
+    }
+    attn_groups = [
+        AttentionGroup(backend, [name], specs[name], 0)
+        for name, backend in (
+            ("mla", DeepseekV4FlashMLABackend),
+            ("indexer", DeepseekV41IndexerBackend),
+        )
+    ]
+    num_blocks = 3
+    block_stride = sum(spec.page_size_bytes for spec in specs.values())
+    raw = torch.zeros(num_blocks * block_stride, dtype=torch.int8)
+    offsets = {"mla": 0, "indexer": specs["mla"].page_size_bytes}
+    config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[
+            KVCacheTensor(raw.numel(), [name], offset, block_stride)
+            for name, offset in offsets.items()
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(list(specs), UniformTypeKVCacheSpecs(block_size, specs))
+        ],
+    )
+    kernel_block_sizes = prepare_kernel_block_sizes(config, [attn_groups])
+    caches = _reshape_kv_cache(
+        attn_groups,
+        dict.fromkeys(specs, raw),
+        "fp8_ds_mla",
+        kernel_block_sizes,
+        {},
+        config,
+    )
+
+    assert kernel_block_sizes == [block_size]
+    expected = torch.zeros_like(raw)
+    for value, (name, spec) in enumerate(specs.items(), start=1):
+        cache = caches[name]
+        assert cache.shape == (
+            num_blocks,
+            block_size // compress_ratio,
+            584 if name == "mla" else 132,
+        )
+        assert cache.stride(0) == block_stride
+        cache[1].fill_(value)
+        start = block_stride + offsets[name]
+        expected[start : start + spec.real_page_size_bytes] = value
+    torch.testing.assert_close(raw, expected)

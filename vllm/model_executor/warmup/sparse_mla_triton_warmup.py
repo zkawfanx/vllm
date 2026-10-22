@@ -19,6 +19,7 @@ _DEEPSEEK_V4_SPARSE_MLA_BACKENDS = frozenset(
         "FLASHINFER_MLA_SPARSE_DSV4",
         "ROCM_FLASHMLA_SPARSE_DSV4",
         "TRITON_MLA_SPARSE_DSV4",
+        "TRITON_MLA_SPARSE_DSV41",
         "DEEPSEEK_SPARSE_SWA",
     }
 )
@@ -79,9 +80,15 @@ def _compile_prefill_chunk_metadata_kernel(
 def _compile_combine_topk_swa_indices_kernel(
     vllm_config: "VllmConfig",
 ) -> None:
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        _COMBINE_TOPK_SWA_INDICES_KERNEL,
-    )
+    model_type = getattr(vllm_config.model_config.hf_config, "model_type", None)
+    if model_type == "deepseek_v41":
+        from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+            _COMBINE_TOPK_SWA_INDICES_KERNEL,
+        )
+    else:
+        from vllm.models.deepseek_v4.common.ops.cache_utils import (
+            _COMBINE_TOPK_SWA_INDICES_KERNEL,
+        )
 
     _COMBINE_TOPK_SWA_INDICES_KERNEL.warmup(vllm_config)
 

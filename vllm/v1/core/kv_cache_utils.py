@@ -22,6 +22,7 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
     KVCacheConfig,
@@ -675,15 +676,24 @@ def resolve_kv_cache_block_sizes(
     ):
         return scheduler_block_size, scheduler_block_size
 
+    # Non-prefix-cacheable groups (for example V4.1's circular compressor
+    # buffer) still contribute to scheduler alignment, but their capacity is
+    # not a prefix-hash boundary and must not constrain hash granularity.
+    hashing_block_sizes = [
+        bs
+        for group, bs in zip(groups, group_block_sizes)
+        if group.kv_cache_spec.prefix_cacheable
+    ] or group_block_sizes
     requested = cache_config.prefix_match_unit
     hash_block_size = (
-        requested if requested is not None else math.gcd(*group_block_sizes)
+        requested if requested is not None else math.gcd(*hashing_block_sizes)
     )
-    if any(bs % hash_block_size != 0 for bs in group_block_sizes):
+    if any(bs % hash_block_size != 0 for bs in hashing_block_sizes):
         raise ValueError(
-            f"Invalid prefix_match_unit={hash_block_size}; all KV cache group "
+            f"Invalid prefix_match_unit={hash_block_size}; prefix-cacheable KV "
             f"block sizes must be divisible by prefix_match_unit. "
-            f"Got group block sizes={group_block_sizes}."
+            f"Got group block sizes={group_block_sizes}, "
+            f"prefix-cacheable={hashing_block_sizes}."
         )
     return scheduler_block_size, hash_block_size
 
@@ -1313,6 +1323,7 @@ def _use_packed_kv_cache_config(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups
     )
+    has_circular_buffer = _has_circular_buffer_group(kv_cache_groups)
     kv_transfer_config = vllm_config.kv_transfer_config
     extra_config = (
         kv_transfer_config.kv_connector_extra_config
@@ -1324,7 +1335,23 @@ def _use_packed_kv_cache_config(
     enable_cross_layers = (
         str(extra_config.get("enable_cross_layers_blocks", "False")).lower() == "true"
     )
-    return is_dsv4 or (enable_cross_layers and len(kv_cache_groups) > 1)
+    return (
+        is_dsv4
+        or has_circular_buffer
+        or (enable_cross_layers and len(kv_cache_groups) > 1)
+    )
+
+
+def _has_circular_buffer_group(kv_cache_groups: list[KVCacheGroupSpec]) -> bool:
+    return any(
+        isinstance(spec, CircularBufferSpec)
+        for group in kv_cache_groups
+        for spec in (
+            group.kv_cache_spec.kv_cache_specs.values()
+            if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
+            else (group.kv_cache_spec,)
+        )
+    )
 
 
 def _get_kv_cache_config_packed(
@@ -1764,7 +1791,7 @@ def _annotate_eagle_groups_deepseek_v4(
         return
     # Detection uses the merged MLA spec's model_version.
     if not any(
-        getattr(spec, "model_version", None) == "deepseek_v4"
+        getattr(spec, "model_version", None) in ("deepseek_v4", "deepseek_v41")
         for spec in kv_cache_spec.values()
     ):
         return
@@ -1791,6 +1818,44 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
+    circular_specs = {
+        name: spec
+        for name, spec in kv_cache_spec.items()
+        if isinstance(spec, CircularBufferSpec)
+    }
+    if circular_specs:
+        non_circular_specs = {
+            name: spec
+            for name, spec in kv_cache_spec.items()
+            if not isinstance(spec, CircularBufferSpec)
+        }
+        groups = get_kv_cache_groups(vllm_config, non_circular_specs)
+        anchor_bytes = (
+            _get_packed_kv_cache_layout(groups)[0]
+            if groups
+            else sum(spec.page_size_bytes for spec in circular_specs.values())
+        )
+        circular_buckets: dict[int, dict[str, KVCacheSpec]] = defaultdict(dict)
+        for name, spec in circular_specs.items():
+            circular_buckets[spec.block_size][name] = spec
+        for bucket in circular_buckets.values():
+            # Cap state groups at the block slab already needed by attention.
+            max_page_size = max(spec.page_size_bytes for spec in bucket.values())
+            states_per_block = max(anchor_bytes // max_page_size, 1)
+            num_groups = cdiv(len(bucket), states_per_block)
+            names = list(bucket)
+            for i in range(num_groups):
+                group_names = names[i::num_groups]
+                uniform = UniformTypeKVCacheSpecs.from_specs(
+                    {name: bucket[name] for name in group_names}
+                )
+                assert uniform is not None
+                groups.append(KVCacheGroupSpec(group_names, uniform))
+        for group in groups:
+            group.is_eagle_group = False
+        _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, groups)
+        return groups
+
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
@@ -1910,6 +1975,20 @@ def _max_memory_usage_bytes_from_groups(
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
         )
+    elif _has_circular_buffer_group(kv_cache_groups):
+        # Circular compressor state uses one non-prefix-cacheable ring block per
+        # request and may have a different page size from the MLA groups. The
+        # packed allocator shares one block slab; each group claims its own
+        # block IDs from that pool.
+        block_stride, _ = _get_packed_kv_cache_layout(kv_cache_groups)
+        total_blocks = sum(
+            cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            for group in kv_cache_groups
+        )
+        return block_stride * total_blocks
     elif all(
         isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         for group in kv_cache_groups

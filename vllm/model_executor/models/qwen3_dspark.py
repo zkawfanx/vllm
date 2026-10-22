@@ -10,8 +10,9 @@ The parallel backbone is a standard Qwen3 decoder stack reused from the
 DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
   * ``markov_head``: low-rank V x r / r x V transition bias added to the base
     logits, sampled left-to-right by the speculator (the sequential stage).
+  * ``confidence_head``: per-position acceptance-probability estimate.
 
-DSparkMarkovHead is shared with the DSV4-style DSpark model.
+DSparkMarkovHead and DSparkConfidenceHead are shared with DSV4-style models.
 """
 
 from collections.abc import Iterable
@@ -22,6 +23,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.logger import init_logger
+from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -169,6 +171,34 @@ class DSparkMarkovHead(nn.Module):
             tp_size=w2.tp_size,
             tp_rank=w2.tp_rank,
         )
+
+
+class DSparkConfidenceHead(nn.Module):
+    """DSpark acceptance-confidence head."""
+
+    def __init__(
+        self,
+        input_dim: int,
+        prefix: str,
+        bias: bool = False,
+        with_markov: bool = True,
+    ) -> None:
+        super().__init__()
+        self.with_markov = with_markov
+        self.proj = ReplicatedLinear(
+            input_dim,
+            1,
+            bias=bias,
+            return_bias=False,
+            params_dtype=torch.float32,
+            prefix=maybe_prefix(prefix, "proj"),
+        )
+
+    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
+        x = (
+            torch.cat([hidden, markov_embed], dim=-1) if self.with_markov else hidden
+        ).float()
+        return self.proj(x).squeeze(-1)
 
 
 class Qwen3DSparkModel(DFlashQwen3Model):

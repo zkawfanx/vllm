@@ -42,6 +42,39 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 logger = init_logger(__name__)
 
 
+def dsa_indexer_uses_fp4(vllm_config: VllmConfig) -> bool:
+    """Return whether the sparse indexer should use the MXFP4 K cache.
+
+    Newer upstream configs expose ``resolve_indexer_kv_dtype``. This branch
+    predates that API and keeps ``use_fp4_indexer_cache`` plus a ``bf16``
+    default, while the DeepSeek indexer fallback stores the non-FP4 path in
+    its FP8 layout. Preserve that behavior on Ampere and only enable MXFP4 on
+    SM100-class devices.
+    """
+    attention_config = vllm_config.attention_config
+    resolve_dtype = getattr(attention_config, "resolve_indexer_kv_dtype", None)
+    if resolve_dtype is not None:
+        kv_dtype = resolve_dtype("fp8")
+    else:
+        kv_dtype = getattr(attention_config, "indexer_kv_dtype", "fp8")
+        if getattr(attention_config, "use_fp4_indexer_cache", False):
+            kv_dtype = "mxfp4"
+
+    if kv_dtype in ("bf16", "fp8", "auto"):
+        return False
+    if kv_dtype != "mxfp4":
+        raise ValueError(
+            f"indexer_kv_dtype={kv_dtype!r} is not supported by the DeepSeek "
+            "sparse indexer (expected 'fp8' or 'mxfp4')."
+        )
+    if not current_platform.is_device_capability_family(100):
+        raise ValueError(
+            "indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs "
+            "(sm_10x); earlier architectures are not supported."
+        )
+    return True
+
+
 @triton.jit
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
@@ -115,9 +148,7 @@ def shard_chunk_specs_by_query(
     data-dependent, which hangs rather than misbehaves.
     """
     if tp_size <= 1:
-        return [
-            ShardedChunkSpec(r, q, q.start > 0, None, None) for r, q in chunk_specs
-        ]
+        return [ShardedChunkSpec(r, q, q.start > 0, None, None) for r, q in chunk_specs]
 
     out: list[ShardedChunkSpec] = []
     prev_req: tuple[int, int] | None = None
@@ -364,6 +395,19 @@ class DeepseekV4IndexerBackend(DeepseekV32IndexerBackend):
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [256]
+
+
+class DeepseekV41IndexerBackend(DeepseekV4IndexerBackend):
+    @staticmethod
+    def get_name() -> str:
+        return "DEEPSEEK_V41_INDEXER"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        if current_platform.is_device_capability_family(80):
+            # Match the MLA backend so the shared packed pages are not split.
+            return [MultipleOf(128)]
+        return [64 if current_platform.is_device_capability_family(90) else 128]
 
 
 @dataclass
@@ -1205,9 +1249,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.decode_shard_min_reqs,
             )
 
-            seq_lens_is_buffer_view = (use_native and next_n > 1) or (
-                not use_native and max_decode_len > 1
-            )
+            seq_lens_is_buffer_view = not use_native or next_n > 1
 
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global

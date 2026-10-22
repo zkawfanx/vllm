@@ -342,12 +342,14 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]}
             )
-        if hf_config.model_type == "deepseek_v4":
+        if hf_config.model_type in ("deepseek_v4", "deepseek_v41"):
+            is_v41 = hf_config.model_type == "deepseek_v41"
             hf_config.model_type = "deepseek_mtp"
             n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
-            hf_config.update(
-                {"n_predict": n_predict, "architectures": ["DeepSeekV4MTPModel"]}
-            )
+            overrides = {"n_predict": n_predict}
+            if not is_v41:
+                overrides["architectures"] = ["DeepSeekV4MTPModel"]
+            hf_config.update(overrides)
         if hf_config.model_type in ("pangu_ultra_moe"):
             hf_config.model_type = "pangu_ultra_moe_mtp"
         if hf_config.model_type == "pangu_ultra_moe_mtp":
@@ -905,6 +907,15 @@ class SpeculativeConfig:
                 ):
                     self.method = "mtp"
                     if (
+                        self.target_model_config is not None
+                        and self.target_model_config.hf_config.model_type
+                        == "deepseek_v41"
+                    ):
+                        raise ValueError(
+                            "DeepSeek V4.1 has no classic-MTP draft; use "
+                            "speculative method 'dspark' instead of 'mtp'."
+                        )
+                    if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
                         not in ("step3p5_mtp", "inkling_mtp")
@@ -956,12 +967,22 @@ class SpeculativeConfig:
                     and "Gemma4DSparkModel" not in self.draft_model_config.architectures
                     and "K3DSparkModel" not in self.draft_model_config.architectures
                 ):
-                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
+                    # DeepSeek-V4(.1) DSpark reuses the full target config
                     # and its weights ship in the target checkpoint.
-                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
-                    self.draft_model_config.hf_config.architectures = [
-                        "DSparkDraftModel"
+                    is_v41 = (
+                        self.target_model_config.hf_config.model_type == "deepseek_v41"
+                    )
+                    draft_hf_config = self.draft_model_config.hf_config
+                    draft_hf_config.model_type = (
+                        "deepseek_v41" if is_v41 else "deepseek_v4"
+                    )
+                    draft_hf_config.architectures = [
+                        "DSparkV41DraftModel" if is_v41 else "DSparkDraftModel"
                     ]
+                    if is_v41:
+                        draft_hf_config.n_predict = getattr(
+                            draft_hf_config, "dspark_block_size", None
+                        ) or getattr(draft_hf_config, "n_predict", None)
                     self.update_arch_()
                 elif (
                     self.method == "dspark"

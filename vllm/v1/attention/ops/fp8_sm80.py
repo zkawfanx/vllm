@@ -20,7 +20,7 @@ gfx942, which has it.
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import HAS_TRITON, tl, triton
 
 
 def native_fp8_cast_supported() -> bool:
@@ -40,9 +40,11 @@ def native_fp8_cast_supported() -> bool:
 # plumbing. Defaults to the software path: it is bit-exact everywhere, just
 # slower, so a failed probe degrades performance rather than compilation.
 try:
-    _NATIVE_FP8_CAST = tl.constexpr(native_fp8_cast_supported())
+    _NATIVE_FP8_CAST = (
+        tl.constexpr(native_fp8_cast_supported()) if HAS_TRITON else False
+    )
 except Exception:
-    _NATIVE_FP8_CAST = tl.constexpr(False)
+    _NATIVE_FP8_CAST = tl.constexpr(False) if HAS_TRITON else False
 
 
 _E4M3FN_BF16_LUT_CACHE: dict[tuple[torch.device, float | None], torch.Tensor] = {}

@@ -41,6 +41,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -174,6 +175,42 @@ def make_kv_cache_config_hybrid_model(
                 second_spec,
             ),
         ],
+    )
+
+
+def test_hybrid_prefix_cache_ignores_non_cacheable_ring_block_size():
+    """Non-cacheable circular state may use a smaller block than hash pages."""
+    block_size = 32
+    kv_cache_config = KVCacheConfig(
+        num_blocks=16,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["attention"],
+                FullAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+            KVCacheGroupSpec(
+                ["compressor"],
+                CircularBufferSpec(
+                    block_size=8,
+                    num_kv_heads=1,
+                    head_size=1,
+                    dtype=torch.float32,
+                ),
+            ),
+        ],
+    )
+
+    make_kv_cache_manager(
+        kv_cache_config,
+        max_model_len=1024,
+        enable_caching=True,
+        hash_block_size=block_size,
     )
 
 

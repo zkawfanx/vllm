@@ -35,6 +35,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "DiffusionGemmaTextConfig": "vllm.transformers_utils.configs.diffusion_gemma",
     "DeepseekVLV2Config": "vllm.transformers_utils.configs.deepseek_vl2",
     "DeepseekV4Config": "vllm.transformers_utils.configs.deepseek_v4",
+    "DeepseekV41Config": "vllm.transformers_utils.configs.deepseek_v41",
     "K3DSparkConfig": "vllm.transformers_utils.configs.k3_dspark",
     "DotsOCRConfig": "vllm.transformers_utils.configs.dotsocr",
     "EAGLEConfig": "vllm.transformers_utils.configs.eagle",

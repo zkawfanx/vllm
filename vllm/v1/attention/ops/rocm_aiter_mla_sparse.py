@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -597,6 +598,21 @@ def rocm_fp8_mqa_logits(
         return fp8_mqa_logits_torch(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
 
 
+def _max_decode_logits_rows(num_batched_tokens: int) -> int:
+    """Bound decode workspace rows by the scheduler's actual batch shape."""
+    try:
+        vllm_config = get_current_vllm_config()
+    except Exception:
+        return num_batched_tokens
+    scheduler_config = getattr(vllm_config, "scheduler_config", None)
+    max_num_seqs = getattr(scheduler_config, "max_num_seqs", None)
+    if not max_num_seqs:
+        return num_batched_tokens
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    num_spec = getattr(speculative_config, "num_speculative_tokens", 0) or 0
+    return min(num_batched_tokens, max_num_seqs * (1 + num_spec))
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -612,6 +628,10 @@ def rocm_aiter_sparse_attn_indexer_fake(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     return topk_indices_buffer
 
@@ -632,6 +652,10 @@ def rocm_aiter_sparse_attn_indexer(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor | None,
     skip_k_cache_insert: bool = False,
+    compress_ratio: int = 1,
+    candidate_blocks: torch.Tensor | None = None,
+    candidate_block_size: int = 0,
+    candidate_write: bool = False,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     attn_metadata = get_forward_context().attn_metadata
@@ -656,15 +680,15 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
-        # batch_size * next_n <= hidden_states.shape[0] == max_num_batched_tokens
+        decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
         if _ON_GFX942 or _ON_GFX950:
             workspace_manager.get_simultaneous(
-                ((hidden_states.shape[0], max_model_len), torch.float32),
+                ((decode_rows, max_model_len), torch.float32),
             )
         else:
             workspace_manager.get_simultaneous(
                 (
-                    (q_fp8.shape[1], hidden_states.shape[0], max_model_len),
+                    (q_fp8.shape[1], decode_rows, max_model_len),
                     torch.float32,
                 ),
             )
@@ -693,6 +717,10 @@ def rocm_aiter_sparse_attn_indexer(
             total_seq_lens,
             topk_indices_buffer,
             skip_k_cache_insert,
+            compress_ratio,
+            candidate_blocks,
+            candidate_block_size,
+            candidate_write,
         )
     layer_attn_metadata = attn_metadata[k_cache_prefix]
     assert isinstance(layer_attn_metadata, DeepseekV32IndexerMetadata)
@@ -747,6 +775,30 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
+            if candidate_blocks is not None:
+                from vllm.model_executor.layers.sparse_attn_indexer import (
+                    _apply_candidate_mask,
+                    _select_candidate_blocks,
+                )
+
+                chunk_candidates = candidate_blocks[chunk.token_start : chunk.token_end]
+                if candidate_write:
+                    _select_candidate_blocks(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates.shape[1],
+                        candidate_block_size,
+                        chunk_candidates,
+                    )
+                else:
+                    _apply_candidate_mask(
+                        logits,
+                        chunk.cu_seqlen_ks,
+                        chunk.cu_seqlen_ke,
+                        chunk_candidates,
+                        candidate_block_size,
+                    )
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
@@ -799,6 +851,37 @@ def rocm_aiter_sparse_attn_indexer(
             max_model_len=max_model_len,
         )
 
+        if candidate_blocks is not None:
+            from vllm.model_executor.layers.sparse_attn_indexer import (
+                _apply_candidate_mask,
+                _select_candidate_blocks,
+            )
+
+            num_rows = logits.shape[0]
+            visible = decode_metadata.seq_lens.reshape(-1)
+            if visible.numel() != num_rows:
+                visible = visible.repeat_interleave(next_n)
+            visible = visible[:num_rows].to(torch.int64)
+            row_starts = torch.zeros_like(visible)
+            decode_candidates = candidate_blocks[:num_rows]
+            if candidate_write:
+                _select_candidate_blocks(
+                    logits,
+                    row_starts,
+                    visible,
+                    decode_candidates.shape[1],
+                    candidate_block_size,
+                    decode_candidates,
+                )
+            else:
+                _apply_candidate_mask(
+                    logits,
+                    row_starts,
+                    visible,
+                    decode_candidates,
+                    candidate_block_size,
+                )
+
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
@@ -834,6 +917,8 @@ def _decode_e8m0_scales(scale: torch.Tensor) -> torch.Tensor:
         )
 
         return _upcast_e8m0_to_fp32(scale).contiguous()
+    if scale.dtype == torch.uint8:
+        return torch.exp2(scale.to(torch.int16).to(torch.float32) - 127.0)
     return scale.to(torch.float32)
 
 
@@ -958,14 +1043,15 @@ def _get_cached_wo_a_bf16(
     cached = getattr(wo_a, "_dsv4_wo_a_bf16", None)
     if cached is not None:
         return cached
-    if hasattr(wo_a, "weight_scale_inv"):
+    wo_a_scale_param = getattr(wo_a, "weight_scale_inv", None)
+    if wo_a_scale_param is None:
+        wo_a_scale_param = getattr(wo_a, "weight_scale", None)
+    if wo_a_scale_param is not None and wo_a.weight.element_size() == 1:
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.float32
         )
         wo_a_scale = _expand_2d_block_scales(
-            wo_a.weight_scale_inv.view(
-                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
-            ),
+            wo_a_scale_param.view(n_local_groups, -1, wo_a_scale_param.shape[-1]),
             o_lora_rank,
             hidden_dim,
         )
@@ -1307,7 +1393,7 @@ def _sparse_attn_prefill_ragged_kernel(
         )
 
         scores = tl.dot(q, tl.trans(kv)) * scale
-        if EXACT_TILE:
+        if EXACT_TILE:  # noqa: SIM108 - keep the constexpr branch compile-time
             keep = valid[None, :]
         else:
             keep = head_mask[:, None] & valid[None, :]
@@ -2269,9 +2355,7 @@ def _sparse_attn_decode_partial_blocked_kernel(
         # longest of them. Every row starts at 0, which makes the shared body
         # mask-free up to the shortest length.
         extra_start_last = tl.load(extra_indptr_ptr + q_base + group_size - 1)
-        extra_union = (
-            tl.load(extra_indptr_ptr + q_base + group_size) - extra_start_last
-        )
+        extra_union = tl.load(extra_indptr_ptr + q_base + group_size) - extra_start_last
         extra_row_len = tl.load(extra_indptr_ptr + token + 1) - tl.load(
             extra_indptr_ptr + token
         )
@@ -2624,9 +2708,7 @@ def _rocm_sparse_attn_prefill_blocked_triton(
 
     if out is None:
         out = torch.empty_like(q, dtype=torch.bfloat16)
-    _sparse_attn_prefill_blocked_kernel[
-        (block_req.numel(), num_heads // block_h)
-    ](
+    _sparse_attn_prefill_blocked_kernel[(block_req.numel(), num_heads // block_h)](
         q,
         kv,
         block_req,

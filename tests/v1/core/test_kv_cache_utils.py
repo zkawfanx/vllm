@@ -44,6 +44,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     ChunkedLocalAttentionSpec,
+    CircularBufferSpec,
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -2147,6 +2148,29 @@ def test_group_and_unify_kv_cache_specs_mixed_page_size_groups():
     assert len(grouped) == 2
     layer_names = {name for g in grouped for name in g.kv_cache_specs}
     assert layer_names == {"mla.0", "mla.1", "swa.0"}
+
+
+def test_mixed_deepseek_v41_specs_keep_circular_compressor_group():
+    """Mixed MLA/SWA grouping must retain V4.1's non-cacheable ring state."""
+    specs = {
+        "mla.0": new_mla_spec(block_size=64),
+        "swa.0": new_swa_mla_spec(head_size=1024),
+        "layers.0.compressor.state_cache": CircularBufferSpec(
+            block_size=8,
+            num_kv_heads=1,
+            head_size=1024,
+            dtype=torch.float32,
+        ),
+    }
+
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+    layer_names = [name for group in groups for name in group.layer_names]
+
+    assert sorted(layer_names) == sorted(specs)
+    ring_group = next(
+        group for group in groups if "compressor.state_cache" in group.layer_names[0]
+    )
+    assert not ring_group.kv_cache_spec.prefix_cacheable
 
 
 def new_indexer_mla_spec(block_size=16):

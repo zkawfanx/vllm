@@ -101,6 +101,7 @@ class KVCacheSpecKind(str, Enum):
     SINK_FULL_ATTENTION = "sink_full_attention"
     ENCODER_ONLY_ATTENTION = "encoder_only_attention"
     CROSS_ATTENTION = "cross_attention"
+    CIRCULAR_BUFFER = "circular_buffer"
     UNKNOWN = "unknown"
 
 
@@ -112,6 +113,11 @@ class KVCacheSpec:
 
     # number of tokens in a block
     block_size: int
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        """Whether blocks from this spec may participate in prefix caching."""
+        return True
 
     @property
     def page_size_bytes(self) -> int:
@@ -188,6 +194,25 @@ class AttentionSpec(KVCacheSpec):
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE
     page_size_padded: int | None = None
     indexes_kv_by_block_stride: bool = False
+    # Number of input tokens represented by one stored state.  This metadata
+    # is used by DeepSeek V4.1's compressed MLA path; the older cache layouts
+    # retain the default value of one.
+    tokens_per_state: int = 1
+    # Explicit packed bytes per state, when the cache layout is not described
+    # by ``head_size`` and ``dtype`` (for example fp8_ds_mla).
+    state_content_bytes: int | None = None
+
+    @property
+    def num_states(self) -> int:
+        if self.tokens_per_state > 0:
+            return self.block_size // self.tokens_per_state
+        return 1
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        if self.state_content_bytes is not None:
+            return self.state_content_bytes
+        return self.real_page_size_bytes // max(self.num_states, 1)
 
     @property
     def unpadded_page_size_bytes(self) -> int:
@@ -312,6 +337,8 @@ class FullAttentionSpec(AttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
+            tokens_per_state=specs[0].tokens_per_state,
+            state_content_bytes=specs[0].state_content_bytes,
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             # If any layer in the group is non-causal, treat the group as
@@ -398,6 +425,17 @@ class MLAAttentionSpec(FullAttentionSpec):
 
     def __post_init__(self):
         super().__post_init__()
+        # DeepSeek V4 uses the older ``compress_ratio`` spelling while V4.1
+        # publishes the layout-neutral ``tokens_per_state`` field.  Keep both
+        # views synchronized so either model generation can construct a spec.
+        if self.tokens_per_state != 1 and self.compress_ratio != 1:
+            assert self.tokens_per_state == self.compress_ratio, (
+                "compress_ratio and tokens_per_state must agree"
+            )
+        elif self.tokens_per_state != 1:
+            object.__setattr__(self, "compress_ratio", self.tokens_per_state)
+        else:
+            object.__setattr__(self, "tokens_per_state", self.compress_ratio)
         _apply_alignment_padding(self)
 
     @property
@@ -432,11 +470,15 @@ class MLAAttentionSpec(FullAttentionSpec):
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
+        tokens_per_state_set = set(spec.tokens_per_state for spec in specs)
+        state_content_bytes_set = set(spec.state_content_bytes for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         block_stride_set = set(spec.indexes_kv_by_block_stride for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(compress_ratio_set) == 1
+            and len(tokens_per_state_set) == 1
+            and len(state_content_bytes_set) == 1
             and len(model_version_set) == 1
             and len(block_stride_set) == 1
         ), (
@@ -454,6 +496,8 @@ class MLAAttentionSpec(FullAttentionSpec):
             indexes_kv_by_block_stride=block_stride_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
+            tokens_per_state=tokens_per_state_set.pop(),
+            state_content_bytes=state_content_bytes_set.pop(),
             model_version=model_version_set.pop(),
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
@@ -625,6 +669,51 @@ class SlidingWindowSpec(AttentionSpec):
             and spec.sliding_window == self.sliding_window
             for spec in kv_cache_specs.values()
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CircularBufferSpec(AttentionSpec):
+    """One block per request holding the compressor's open token group."""
+
+    head_size_v: int | None = None
+
+    def __post_init__(self):
+        if self.head_size_v is None:
+            object.__setattr__(self, "head_size_v", 0)
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        return (
+            self.block_size
+            * self.num_kv_heads
+            * (self.head_size + self.head_size_v)
+            * get_dtype_size(self.dtype)
+        )
+
+    @property
+    def state_content_size_bytes(self) -> int:
+        if self.state_content_bytes is not None:
+            return self.state_content_bytes
+        return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        del vllm_config
+        return self.page_size_bytes
+
+    def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:
+        del vllm_config, max_len
+        return 1
+
+    def is_uniform_with_collection(
+        self, kv_cache_specs: dict[str, KVCacheSpec]
+    ) -> bool:
+        return all(
+            isinstance(spec, CircularBufferSpec) for spec in kv_cache_specs.values()
+        )
+
+    @property
+    def prefix_cacheable(self) -> bool:
+        return False
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -845,6 +934,10 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
     kv_cache_specs: dict[str, KVCacheSpec]
 
     @property
+    def prefix_cacheable(self) -> bool:
+        return all(spec.prefix_cacheable for spec in self.kv_cache_specs.values())
+
+    @property
     def page_size_bytes(self) -> int:
         return sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
 
@@ -911,6 +1004,8 @@ def get_kv_cache_spec_kind(kv_cache_spec: KVCacheSpec) -> KVCacheSpecKind:
     # more precise kind.
     if isinstance(kv_cache_spec, SlidingWindowMLASpec):
         return KVCacheSpecKind.SLIDING_WINDOW_MLA
+    if isinstance(kv_cache_spec, CircularBufferSpec):
+        return KVCacheSpecKind.CIRCULAR_BUFFER
     if isinstance(kv_cache_spec, MLAAttentionSpec):
         return KVCacheSpecKind.MLA_ATTENTION
     if isinstance(kv_cache_spec, SinkFullAttentionSpec):

@@ -5,9 +5,42 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from tests.kernels.quant_utils import native_per_token_group_quant_fp8
 from vllm.model_executor.layers.quantization.utils import fp8_utils, int8_utils
 from vllm.model_executor.layers.quantization.utils.quant_utils import get_fp8_min_max
 from vllm.platforms import current_platform
+
+
+def _fp8_reference(
+    x: torch.Tensor,
+    group_size: int,
+    *,
+    use_ue8m0: bool,
+    column_major_scales: bool = False,
+    tma_aligned_scales: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if current_platform.is_device_capability_family(80):
+        with patch(
+            "tests.kernels.quant_utils.is_deep_gemm_e8m0_used",
+            return_value=use_ue8m0,
+        ):
+            ref_q, ref_s = native_per_token_group_quant_fp8(
+                x.float(),
+                group_size,
+                dtype=current_platform.fp8_dtype(),
+            )
+            if column_major_scales and not tma_aligned_scales:
+                ref_s = ref_s.transpose(-1, -2).contiguous()
+            return ref_q, ref_s
+
+    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
+        return fp8_utils.per_token_group_quant_fp8(
+            x,
+            group_size,
+            column_major_scales=column_major_scales,
+            tma_aligned_scales=tma_aligned_scales,
+            use_ue8m0=use_ue8m0,
+        )
 
 
 @pytest.mark.parametrize(
@@ -39,14 +72,13 @@ def test_per_token_group_quant_fp8(
         use_ue8m0=scale_ue8m0,
     )
 
-    # triton ref
-    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
-        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(
-            x,
-            group_size,
-            column_major_scales=column_major,
-            use_ue8m0=scale_ue8m0,
-        )
+    ref_q, ref_s = _fp8_reference(
+        x,
+        group_size,
+        use_ue8m0=scale_ue8m0,
+        column_major_scales=column_major,
+        tma_aligned_scales=tma_aligned,
+    )
 
     assert torch.allclose(out_q.float(), ref_q.float(), atol=0.15, rtol=0.15)
     assert torch.allclose(scale, ref_s, atol=0.01, rtol=0.01)
@@ -76,6 +108,11 @@ def test_per_token_group_quant_fp8(
         # Larger shapes with padding
         (127, 7168, 128),
         (253, 640, 128),
+        (1, 32, 32),
+        (3, 64, 32),
+        (7, 160, 32),
+        (32, 512, 32),
+        (127, 4096, 32),
     ],
 )
 @pytest.mark.parametrize("poisoned_scales", [False, True])
@@ -86,7 +123,7 @@ def test_per_token_group_quant_fp8(
 def test_per_token_group_quant_fp8_packed(
     num_tokens, hidden_dim, group_size, poisoned_scales
 ):
-    """Test the packed DeepGEMM quantization kernel against the Triton
+    """Test the packed DeepGEMM quantization kernel against the PyTorch
     reference (row-major, UE8M0 scales)."""
 
     device = "cuda"
@@ -129,13 +166,7 @@ def test_per_token_group_quant_fp8_packed(
             use_ue8m0=True,
         )
 
-    # Triton reference (row-major float32 scales, UE8M0)
-    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
-        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(
-            x,
-            group_size,
-            use_ue8m0=True,
-        )
+    ref_q, ref_s = _fp8_reference(x, group_size, use_ue8m0=True)
 
     # Quantized values must match.
     assert torch.equal(out_q, ref_q), "Quantized output mismatch"
@@ -250,12 +281,7 @@ def test_per_token_group_quant_fp8_packed_mantissa_rounds_up():
         use_ue8m0=True,
     )
 
-    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
-        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(
-            x,
-            group_size,
-            use_ue8m0=True,
-        )
+    ref_q, ref_s = _fp8_reference(x, group_size, use_ue8m0=True)
 
     assert torch.equal(out_q, ref_q), "Quantized output mismatch"
 
@@ -331,8 +357,7 @@ def test_per_token_group_quant_fp8_packed_zero_fills_padded_output_q(
     )
 
     # Live rows must match the Triton reference.
-    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
-        ref_q, _ = fp8_utils.per_token_group_quant_fp8(x, group_size, use_ue8m0=True)
+    ref_q, _ = _fp8_reference(x, group_size, use_ue8m0=True)
     assert torch.equal(out_q[:mn], ref_q), "Live region mismatch"
 
     # Padded rows must be all-zero; without this, downstream TMA loads would
@@ -380,10 +405,7 @@ def test_per_token_group_quant_fp8_packed_large_mn():
         use_ue8m0=True,
     )
 
-    with patch("vllm.platforms.current_platform.is_cuda_alike", return_value=False):
-        ref_q, ref_s = fp8_utils.per_token_group_quant_fp8(
-            x, group_size, use_ue8m0=True
-        )
+    ref_q, ref_s = _fp8_reference(x, group_size, use_ue8m0=True)
 
     assert torch.equal(out_q, ref_q), "Quantized output mismatch"
 

@@ -24,6 +24,8 @@ from vllm.v1.attention.backend import (
     CommonAttentionMetadata,
 )
 from vllm.v1.attention.backends.mla.sparse_swa import (
+    _LAYER_TYPE_C1A,
+    _LAYER_TYPE_C2A,
     _LAYER_TYPE_C4A,
     _LAYER_TYPE_C128A,
     _LAYER_TYPE_SWAONLY,
@@ -447,7 +449,15 @@ class DeepseekV4ROCMAiterSparseSWAMetadataBuilder(DeepseekSparseSWAMetadataBuild
     ) -> dict[str, FlashMLASchedMeta | None]:
         # The ragged Triton decode never calls FlashMLA, so skip planning
         # its scheduler metadata entirely.
-        return dict.fromkeys((_LAYER_TYPE_SWAONLY, _LAYER_TYPE_C4A, _LAYER_TYPE_C128A))
+        return dict.fromkeys(
+            (
+                _LAYER_TYPE_SWAONLY,
+                _LAYER_TYPE_C4A,
+                _LAYER_TYPE_C128A,
+                _LAYER_TYPE_C1A,
+                _LAYER_TYPE_C2A,
+            )
+        )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

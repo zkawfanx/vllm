@@ -34,6 +34,7 @@ from .device import DeviceConfig
 from .diffusion import DiffusionConfig
 from .ec_manager_config import EncoderCacheManagerConfig
 from .ec_transfer import ECTransferConfig
+from .engram import EngramConfig
 from .kernel import KernelConfig
 from .kv_events import KVEventsConfig
 from .kv_transfer import KVTransferConfig
@@ -353,6 +354,8 @@ class VllmConfig:
     """Model weight offloading configuration."""
     attention_config: AttentionConfig = Field(default_factory=AttentionConfig)
     """Attention configuration."""
+    engram_config: EngramConfig | None = None
+    """Optional Engram configuration, only valid for supported models."""
     mamba_config: MambaConfig = Field(default_factory=MambaConfig)
     """Mamba configuration."""
     kernel_config: KernelConfig = Field(default_factory=KernelConfig)
@@ -485,6 +488,11 @@ class VllmConfig:
             vllm_factors.append(self.attention_config.compute_hash())
         else:
             vllm_factors.append("None")
+        vllm_factors.append(
+            self.engram_config.compute_hash()
+            if self.engram_config is not None
+            else "None"
+        )
         if self.lora_config:
             vllm_factors.append(self.lora_config.compute_hash())
         else:
@@ -969,6 +977,22 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    def _resolve_and_verify_engram_config(self) -> None:
+        """Resolve legacy Engram offload settings and validate its scope."""
+        if self.engram_config is None:
+            if not envs.VLLM_PLE_CPU_OFFLOAD:
+                return
+            self.engram_config = EngramConfig()
+        model_config = self.model_config
+        speculative_config = self.speculative_config
+        if (
+            speculative_config is not None
+            and model_config is speculative_config.draft_model_config
+        ):
+            model_config = speculative_config.target_model_config
+        self.engram_config.verify_model_config(model_config)
+        self.engram_config.verify_parallel_config(self.parallel_config)
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -979,6 +1003,7 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+        self._resolve_and_verify_engram_config()
 
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
@@ -1215,6 +1240,7 @@ class VllmConfig:
                 a
                 in (
                     "DeepseekV4ForCausalLM",
+                    "DeepseekV41ForCausalLM",
                     "DeepSeekV4MTPModel",
                     "InklingForCausalLM",
                     "InklingForConditionalGeneration",

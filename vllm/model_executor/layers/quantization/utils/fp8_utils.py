@@ -37,6 +37,11 @@ from vllm.utils.platform_utils import get_device_name_as_file_name
 
 logger = init_logger(__name__)
 
+# Pre-fill value for scale parameters whose shards load independently. The
+# shards are combined with .max(), so an unloaded shard must never win; the
+# smallest representable float32 guarantees that.
+FP8_SCALE_SENTINEL = torch.finfo(torch.float32).min
+
 
 def is_fp8(x: torch.dtype | torch.Tensor) -> bool:
     if isinstance(x, torch.Tensor):
@@ -912,14 +917,12 @@ def w8a8_triton_block_scaled_mm(
     assert len(block_size) == 2
     block_n, block_k = block_size[0], block_size[1]
 
-    # Triton cannot currently bind E8M0 scale tensors directly. On ROCm,
-    # DeepSeek-V4 checkpoints store block scales in exponent-only E8M0 format,
-    # so decode them to fp32 before launching the kernel.
-    if current_platform.is_rocm() or current_platform.is_xpu():
-        if As.dtype == torch.float8_e8m0fnu:
-            As = _upcast_e8m0_to_fp32(As).contiguous()
-        if Bs.dtype == torch.float8_e8m0fnu:
-            Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
+    # Triton cannot currently bind E8M0 scale tensors directly. Decode
+    # exponent-only scales before launching the kernel.
+    if As.dtype == torch.float8_e8m0fnu:
+        As = _upcast_e8m0_to_fp32(As).contiguous()
+    if Bs.dtype == torch.float8_e8m0fnu:
+        Bs = _upcast_e8m0_to_fp32(Bs).contiguous()
 
     assert A.shape[-1] == B.shape[-1]
     assert A.shape[:-1] == As.shape[:-1] and A.is_contiguous()
@@ -1064,8 +1067,6 @@ def deepgemm_post_process_weight_scale_block(
     is_sfa: bool = False,
 ) -> torch.Tensor:
     if ws.dtype in (torch.float8_e8m0fnu, torch.uint8):
-        # Scales already in E8M0 from checkpoint; upcast to fp32 and let
-        # DeepGEMM pack the layout expected by the target architecture.
         ws = _upcast_e8m0_to_fp32(ws)
     else:
         assert ws.dtype == torch.float32, (
@@ -1097,9 +1098,6 @@ def deepgemm_post_process_fp8_weight_block(
     )
 
     if ws.dtype in (torch.float8_e8m0fnu, torch.uint8):
-        # Scales already in E8M0 from checkpoint (float8_e8m0fnu, or raw E8M0
-        # bits as uint8 for MXFP8) - upcast to fp32 and skip requantization
-        # (weights already have power-of-two scales).
         ws = _upcast_e8m0_to_fp32(ws)
     else:
         assert ws.dtype == torch.float32, (

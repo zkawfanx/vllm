@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, fields
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -138,6 +138,38 @@ MoEBackend = Literal[
     "hpc",
     "emulation",
 ]
+
+# Backends that use the fused MegaMoE model path.
+FLASHINFER_MOE_EP_BACKENDS = frozenset(
+    {
+        "flashinfer_moe_ep_mega_deep_gemm",
+        "flashinfer_moe_ep_mega_cutedsl",
+    }
+)
+MEGA_MOE_BACKENDS = frozenset({"deep_gemm_mega_moe"}) | FLASHINFER_MOE_EP_BACKENDS
+
+FLASHINFER_MOE_EP_ARCHITECTURES = frozenset(
+    {
+        "DeepseekV4ForCausalLM",
+        "DeepSeekV4MTPModel",
+        "DeepseekV41ForCausalLM",
+    }
+)
+
+
+def validate_flashinfer_moe_ep_model(
+    moe_backend: str, architectures: Iterable[str]
+) -> None:
+    """Reject FlashInfer mega-MoE backends without a compatible model path."""
+    if moe_backend not in FLASHINFER_MOE_EP_BACKENDS:
+        return
+    if not any(arch in FLASHINFER_MOE_EP_ARCHITECTURES for arch in architectures):
+        raise ValueError(
+            f"moe_backend={moe_backend!r} is only supported for DeepSeek-V4 "
+            f"models ({sorted(FLASHINFER_MOE_EP_ARCHITECTURES)}), but the "
+            f"model is {list(architectures)}."
+        )
+
 
 LinearBackend = Literal[
     "auto",
@@ -283,6 +315,11 @@ class KernelConfig:
     def set_platform_defaults(self, vllm_config: "VllmConfig") -> None:
         """Set platform-specific defaults for the kernel config."""
         from vllm.platforms import current_platform
+
+        if vllm_config.model_config is not None:
+            validate_flashinfer_moe_ep_model(
+                self.moe_backend, vllm_config.model_config.architectures
+            )
 
         platform_op_priority = current_platform.get_default_ir_op_priority(vllm_config)
         logger.debug(

@@ -558,12 +558,17 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.hash_block_size = hash_block_size
         self.dcp_world_size = dcp_world_size
         group_block_sizes = [
-            manager.block_size for manager in self.single_type_managers
+            manager.block_size
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable
         ]
         assert all(
             block_size % hash_block_size == 0 for block_size in group_block_sizes
         ), (
-            "Each KV cache group's real block_size must be divisible by "
+            "Each prefix-cacheable KV cache group's real block_size must be "
+            "divisible by "
             f"hash_block_size. block_sizes={group_block_sizes}, "
             f"hash_block_size={hash_block_size}"
         )
