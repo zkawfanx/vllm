@@ -5,10 +5,12 @@ import tempfile
 
 import huggingface_hub.constants
 import pytest
+import torch
 from huggingface_hub.utils import LocalEntryNotFoundError
 
 from vllm.model_executor.model_loader.weight_utils import (
     download_weights_from_hf,
+    initialize_single_dummy_weight,
     maybe_remap_kv_scale_name,
 )
 
@@ -43,6 +45,72 @@ def test_download_weights_from_hf():
             )
             is not None
         )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(
+    ("dtype", "value"),
+    [(torch.float32, 0.0), (torch.float8_e4m3fn, 1.0), (torch.uint8, 127)],
+)
+def test_dummy_value_override_preserves_tensor_identity(device, dtype, value):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    parameter = torch.nn.Parameter(
+        torch.empty(8, dtype=dtype, device=device), requires_grad=False
+    )
+    parameter.dummy_weight_value = value
+    storage = parameter.data_ptr()
+    initialize_single_dummy_weight(parameter)
+    assert parameter.data_ptr() == storage
+    assert parameter.dtype == dtype
+    assert parameter.float().tolist() == [value] * 8
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
+def test_dummy_default_distribution_and_seed_are_unchanged(dtype):
+    parameter = torch.empty(32, dtype=dtype)
+    expected = torch.empty(
+        32, dtype=torch.float16 if dtype == torch.float8_e4m3fn else dtype
+    )
+    expected.uniform_(-1e-3, 1e-3, generator=torch.Generator().manual_seed(1234))
+    initialize_single_dummy_weight(parameter)
+    assert torch.equal(parameter.float(), expected.to(dtype).float())
+
+
+def test_dummy_value_override_is_deferred_on_meta():
+    parameter = torch.empty(8, device="meta")
+    parameter.dummy_weight_value = 1.0
+    initialize_single_dummy_weight(parameter)
+    assert parameter.device.type == "meta"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA/UVA")
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_engram_dummy_values_only_apply_to_cpu_offload(monkeypatch, cpu_offload):
+    from vllm.config.load import LoadConfig
+    from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
+    from vllm.models.deepseek_v4_1.common import engram
+
+    monkeypatch.setattr(engram, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(engram, "get_tensor_model_parallel_rank", lambda: 0)
+    with torch.device("cuda"):
+        layer = engram.ParallelEngramEmbedding(8, 32, (4, 4), cpu_offload=cpu_offload)
+    if not cpu_offload:
+        assert not hasattr(layer.weight, "dummy_weight_value")
+        assert not hasattr(layer.weight_scale_inv, "dummy_weight_value")
+        return
+    weight, scale = layer.weight, layer.weight_scale_inv
+    storage = (weight.data_ptr(), scale.data_ptr())
+    assert weight.is_pinned() and scale.is_pinned()
+    DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(layer, None)
+    assert layer.weight is weight and layer.weight_scale_inv is scale
+    assert (weight.data_ptr(), scale.data_ptr()) == storage
+    assert torch.equal(weight.float(), torch.ones(8, 32))
+    assert scale.tolist() == [[127]] * 8
+    indices = torch.tensor([[0, 4], [3, 7]], device="cuda", dtype=torch.int64)
+    output = torch.empty((2, 2, 32), dtype=torch.bfloat16, device="cuda")
+    layer.lookup(indices, output)
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
 
 
 class TestMaybeRemapKvScaleName:
