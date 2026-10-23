@@ -9,10 +9,13 @@ import torch
 from torch.nn.parameter import UninitializedParameter
 
 import vllm.model_executor.model_loader.reload.meta as reload_meta
+from vllm.config.load import LoadConfig
 from vllm.model_executor.layers.linear import QKVParallelLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
+    get_layerwise_info,
     initialize_layerwise_reload,
     initialize_online_processing,
     record_metadata_for_reloading,
@@ -30,6 +33,7 @@ from vllm.model_executor.model_loader.reload.utils import get_layer_tensors
 from vllm.model_executor.model_loader.weight_utils import (
     composed_weight_loader,
     default_weight_loader,
+    initialize_single_dummy_weight,
 )
 from vllm.platforms import current_platform
 
@@ -590,6 +594,50 @@ class _LateBiasLayer(torch.nn.Module):
         bias = torch.nn.Parameter(torch.zeros(4))
         bias.weight_loader = default_weight_loader
         self.register_parameter("bias", bias)
+
+
+def test_dummy_loader_visits_local_tensors_once_without_replacing_them(monkeypatch):
+    from vllm.model_executor.model_loader import dummy_loader
+
+    layer = torch.nn.Linear(2, 3, bias=False)
+    layer.register_buffer("persistent", torch.full((3,), 7.0))
+    layer.register_buffer("scratch", torch.full((3,), 9.0), persistent=False)
+    layer.weight.dummy_weight_value = 1.0
+    layer.register_buffer("alias", layer.weight.detach(), persistent=False)
+    model = torch.nn.Sequential(torch.nn.Sequential(layer))
+    original = get_layer_tensors(layer)
+    visited = []
+
+    def initialize(tensor):
+        visited.append(id(tensor))
+        initialize_single_dummy_weight(tensor)
+
+    monkeypatch.setattr(dummy_loader, "initialize_single_dummy_weight", initialize)
+    DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(model, None)
+    assert sorted(visited) == sorted([id(layer.weight), id(layer.persistent)])
+    assert all(getattr(layer, name) is tensor for name, tensor in original.items())
+    assert layer.scratch.tolist() == [9.0] * 3
+    assert torch.equal(layer.alias, torch.ones_like(layer.weight))
+    assert layer.alias.data_ptr() == layer.weight.data_ptr()
+    assert layer._non_persistent_buffers_set == {"scratch", "alias"}
+
+
+def test_dummy_loader_preserves_online_materialization_and_quant_processing():
+    quant_method = _RecordingQuantMethod()
+    layer = _LateBiasLayer(quant_method)
+    bias = layer.bias
+    info = get_layerwise_info(layer)
+    assert info.can_load() and layer.weight.is_meta
+    DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(
+        torch.nn.Sequential(layer), None
+    )
+    assert not layer.weight.is_meta and layer.bias is bias
+    expected = torch.empty_like(bias)
+    initialize_single_dummy_weight(expected)
+    torch.testing.assert_close(quant_method.bias_at_process, expected, rtol=0, atol=0)
+    assert layer.weight.weight_loader is default_weight_loader
+    assert layer.bias.weight_loader is default_weight_loader
+    assert not info.can_load()
 
 
 def test_online_processing_waits_for_late_registered_bias():
