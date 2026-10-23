@@ -16,7 +16,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
-from vllm.utils.torch_utils import np_to_pinned_tensor
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -540,7 +539,12 @@ class CommonAttentionMetadata:
         return self._num_computed_tokens_cache
 
     def token_to_req_indices(self, buffer: torch.Tensor) -> torch.Tensor:
-        """Build or reuse the per-token request index mapping."""
+        """Build or reuse the per-token request index mapping.
+
+        Device boundaries are authoritative; the CPU terminal boundary must
+        still contain the current total. The cache aliases the supplied buffer
+        for this metadata instance, including when its kernel is graph-replayed.
+        """
         num_tokens = self.num_actual_tokens
         if self._token_to_req_indices_cache is not None:
             assert self._token_to_req_indices_cache.device == buffer.device
@@ -548,20 +552,21 @@ class CommonAttentionMetadata:
             assert self._token_to_req_indices_cache.shape[0] >= num_tokens
             return self._token_to_req_indices_cache[:num_tokens]
 
-        starts = np.asarray(self.query_start_loc_cpu, dtype=np.int32)
-        query_lens = np.diff(starts)
-        token_to_req_indices = np.repeat(
-            np.arange(query_lens.shape[0], dtype=np.int32), query_lens
-        )
-        num_mapped_tokens = token_to_req_indices.shape[0]
-        assert buffer.shape[0] >= max(num_mapped_tokens, num_tokens)
-        # copy from CPU to GPU
-        buffer[:num_mapped_tokens].copy_(
-            np_to_pinned_tensor(token_to_req_indices), non_blocking=True
-        )
-        if num_mapped_tokens < num_tokens:
-            buffer[num_mapped_tokens:num_tokens].zero_()
-        self._token_to_req_indices_cache = buffer[: max(num_mapped_tokens, num_tokens)]
+        from vllm.v1.attention.ops.metadata import _token_request_mapping_kernel
+
+        num_mapped_tokens = int(self.query_start_loc_cpu[-1])
+        num_output_tokens = max(num_mapped_tokens, num_tokens)
+        assert buffer.shape[0] >= num_output_tokens
+        if num_output_tokens:
+            _token_request_mapping_kernel[((num_output_tokens + 255) // 256,)](
+                self.query_start_loc,
+                buffer,
+                self.query_start_loc.shape[0] - 1,
+                num_mapped_tokens,
+                num_output_tokens,
+                num_warps=4,
+            )
+        self._token_to_req_indices_cache = buffer[:num_output_tokens]
         return self._token_to_req_indices_cache[:num_tokens]
 
     # TODO(lucas): remove once we have FULL-CG spec-decode support
