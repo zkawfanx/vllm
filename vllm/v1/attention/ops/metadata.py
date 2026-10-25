@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Device-side token-to-request mapping."""
 
 from vllm.triton_utils import tl, triton
