@@ -137,10 +137,65 @@ def test_python_argument_conversion_and_partial_values():
         '<｜DSML｜ parameter name="object" string="false">'
         '{"a": [true, null]}</｜DSML｜ parameter>'
         '<｜DSML｜ parameter name="bad" string="false">[broken</｜DSML｜ parameter>'
+        '<｜DSML｜ parameter name="bare">7</｜DSML｜ parameter>'
         '<｜DSML｜ parameter name="text" string="true">  a<b'
     )
     assert json.loads(converter(raw, True)) == {
         "object": {"a": [True, None]},
         "bad": "[broken",
+        "bare": 7,
         "text": "  a<b",
     }
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_registered_adapters_keep_parameters_without_string_attribute(streaming):
+    text = (
+        'Plan.</think><｜DSML｜ calls><｜DSML｜ invoke name="get_weather">'
+        '<｜DSML｜ parameter name="city">杭州</｜DSML｜ parameter>'
+        '<｜DSML｜ parameter name="count">7</｜DSML｜ parameter>'
+        '<｜DSML｜ parameter name="options">{"k": [true, null]}</｜DSML｜ parameter>'
+        '<｜DSML｜ parameter name="quoted" string="true">42</｜DSML｜ parameter>'
+        "</｜DSML｜ invoke></｜DSML｜ calls>"
+    )
+    tokenizer, tokens = tokenizer_for(text, False)
+    parser = parser_for(tokenizer, {"thinking": True})
+    if streaming:
+        output = collect_output(
+            replay_streaming(
+                parser,
+                tokens,
+                chunk_size=3,
+                finished_on_last=True,
+                tools=DUMMY_TOOLS,
+                prompt_token_ids=[50],
+            )
+        )
+        assert output.reasoning == "Plan."
+        assert len(output.tool_calls) == 1
+        arguments = output.tool_calls[0]["arguments"]
+    else:
+        reasoning, _, calls = parser.parse(
+            text,
+            _test_request(tools=DUMMY_TOOLS),
+            enable_auto_tools=True,
+            model_output_token_ids=[tid for tid, _ in tokens],
+        )
+        assert reasoning == "Plan."
+        assert len(calls) == 1
+        arguments = calls[0].arguments
+    assert json.loads(arguments) == {
+        "city": "杭州",
+        "count": 7,
+        "options": {"k": [True, None]},
+        "quoted": "42",
+    }
+
+
+def test_adjacent_parameters_preserve_implicit_close():
+    converter = deepseek_v41_config().arg_converter
+    raw = (
+        '<｜DSML｜ parameter name="first" string="true">text'
+        '<｜DSML｜ parameter name="second" string="false">42</｜DSML｜ parameter>'
+    )
+    assert json.loads(converter(raw, False)) == {"first": "text", "second": 42}

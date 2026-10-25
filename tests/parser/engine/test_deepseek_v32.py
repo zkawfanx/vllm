@@ -95,6 +95,21 @@ def mock_request():
 
 
 class TestNonStreaming:
+    def test_missing_string_attribute_keeps_parameter(
+        self, mock_tokenizer, mock_request
+    ):
+        text = _func_calls(
+            _invoke(
+                "get_weather",
+                '<｜DSML｜parameter name="city">SF</｜DSML｜parameter>',
+            )
+        )
+        result = DeepSeekV32Parser(mock_tokenizer).extract_tool_calls(
+            text, mock_request
+        )
+        assert result.tools_called and len(result.tool_calls) == 1
+        assert json.loads(result.tool_calls[0].function.arguments) == {"city": "SF"}
+
     def test_no_tool_call(self, mock_tokenizer, mock_request):
         parser = DeepSeekV32Parser(mock_tokenizer)
         result = parser.extract_tool_calls("Hello world", mock_request)

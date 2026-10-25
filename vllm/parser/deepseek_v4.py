@@ -47,22 +47,27 @@ DSML_TOOL_END = f"</{_DSML}tool_calls>"
 DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
 DSML_INVOKE_NAME_END = '">'
 DSML_INVOKE_END = f"</{_DSML}invoke>"
+DSML_PARAM_START = f"<{_DSML}parameter"
 DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
 # DeepSeek V3.2-style wrapper, recognized only to reject it as foreign
 DSML_FOREIGN_TOOL_START = f"<{_DSML}function_calls>"
 DSML_FOREIGN_TOOL_END = f"</{_DSML}function_calls>"
 
-_ESCAPED_DSML = re.escape(_DSML)
-_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
-    re.DOTALL,
-)
-_PARTIAL_PARAM_RE = re.compile(
-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
-    rf"(.*)$",
-    re.DOTALL,
-)
+
+def _param_patterns(
+    param_start: str, param_close: str, *, implicit_close: bool = False
+) -> tuple[re.Pattern, re.Pattern]:
+    """Build complete and partial DSML parameter patterns with optional string."""
+    start, close = re.escape(param_start), re.escape(param_close)
+    head = rf'{start}\s+name="([^"]+)"(?:\s+string="([^"]*)")?\s*>'
+    end = rf"(?:{close}|(?={start}\s+name=))" if implicit_close else close
+    return (
+        re.compile(rf"{head}(.*?){end}", re.DOTALL),
+        re.compile(rf"{head}(.*)$", re.DOTALL),
+    )
+
+
+_PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
 
 
 def _dsml_arg_converter(
@@ -75,6 +80,7 @@ def _dsml_arg_converter(
     params: dict[str, object] = {}
 
     last_end = 0
+    # Missing string attributes use JSON when valid, otherwise literal text.
     for m in param_re.finditer(raw_args):
         name, is_str, value = m.group(1), m.group(2), m.group(3)
         if is_str == "true":
