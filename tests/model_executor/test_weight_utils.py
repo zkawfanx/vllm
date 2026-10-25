@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     initialize_single_dummy_weight,
     maybe_remap_kv_scale_name,
 )
+from vllm.platforms import current_platform
 
 
 def test_download_weights_from_hf():
@@ -60,20 +61,25 @@ def test_dummy_value_override_preserves_tensor_identity(device, dtype, value):
     )
     parameter.dummy_weight_value = value
     storage = parameter.data_ptr()
-    initialize_single_dummy_weight(parameter)
+    initialize_single_dummy_weight(parameter, name="weight_scale")
     assert parameter.data_ptr() == storage
     assert parameter.dtype == dtype
     assert parameter.float().tolist() == [value] * 8
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float8_e4m3fn])
-def test_dummy_default_distribution_and_seed_are_unchanged(dtype):
+@pytest.mark.parametrize("use_default", [False, True])
+def test_dummy_range_and_seed_are_reproducible(dtype, use_default):
     parameter = torch.empty(32, dtype=dtype)
     expected = torch.empty(
         32, dtype=torch.float16 if dtype == torch.float8_e4m3fn else dtype
     )
-    expected.uniform_(-1e-3, 1e-3, generator=torch.Generator().manual_seed(1234))
-    initialize_single_dummy_weight(parameter)
+    bound = 1.0 if use_default and dtype == torch.float8_e4m3fn else 1e-3
+    expected.uniform_(-bound, bound, generator=torch.Generator().manual_seed(1234))
+    if use_default:
+        initialize_single_dummy_weight(parameter)
+    else:
+        initialize_single_dummy_weight(parameter, low=-1e-3, high=1e-3)
     assert torch.equal(parameter.float(), expected.to(dtype).float())
 
 
@@ -111,6 +117,51 @@ def test_engram_dummy_values_only_apply_to_cpu_offload(monkeypatch, cpu_offload)
     output = torch.empty((2, 2, 32), dtype=torch.bfloat16, device="cuda")
     layer.lookup(indices, output)
     torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_dummy_fp8_weight_is_not_degenerate(dtype):
+    """+-1e-3 underflows in FP8, so 8-bit floats default to +-1."""
+    param = torch.empty(4096, dtype=dtype)
+    initialize_single_dummy_weight(param)
+    values = param.float()
+    assert values.isfinite().all()
+    assert 0.5 < values.abs().max() <= 1.0
+    assert (values != 0).float().mean() > 0.99
+
+
+@pytest.mark.parametrize(
+    ("dtype", "name"),
+    [(torch.float8_e8m0fnu, "weight_scale_inv"), (torch.uint8, "w13_weight_scale")],
+)
+def test_dummy_e8m0_scale_is_fixed_exponent(dtype, name):
+    """E8M0 scales, including uint8-stored ones, get a finite 2**-7."""
+    param = torch.empty(64, dtype=dtype)
+    initialize_single_dummy_weight(param, name=name)
+    assert (param.view(torch.uint8) == 120).all()
+
+
+@pytest.mark.skipif(
+    current_platform.is_tpu(), reason="TPU does not fill packed weights"
+)
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.int8, torch.float4_e2m1fn_x2])
+def test_dummy_packed_weight_gets_random_bytes(dtype):
+    """Packed weights are filled deterministically instead of left uninitialized."""
+    # Some backends can't fill packed FP4 directly, so view zeroed bytes.
+    params = [torch.zeros(4096, dtype=torch.uint8).view(dtype) for _ in range(2)]
+    for param in params:
+        initialize_single_dummy_weight(param, name="w13_weight")
+    raw = params[0].view(torch.uint8)
+    assert raw.unique().numel() > 250
+    assert torch.equal(raw, params[1].view(torch.uint8))
+
+
+@pytest.mark.skipif(current_platform.is_rocm(), reason="ROCm zeroes integer params")
+def test_dummy_wide_integer_param_is_untouched():
+    """Wider integer params may be indices, so random values are unsafe."""
+    param = torch.arange(16, dtype=torch.int32)
+    initialize_single_dummy_weight(param, name="g_idx")
+    assert torch.equal(param, torch.arange(16, dtype=torch.int32))
 
 
 class TestMaybeRemapKvScaleName:

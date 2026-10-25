@@ -608,9 +608,9 @@ def test_dummy_loader_visits_local_tensors_once_without_replacing_them(monkeypat
     original = get_layer_tensors(layer)
     visited = []
 
-    def initialize(tensor):
+    def initialize(tensor, **kwargs):
         visited.append(id(tensor))
-        initialize_single_dummy_weight(tensor)
+        initialize_single_dummy_weight(tensor, **kwargs)
 
     monkeypatch.setattr(dummy_loader, "initialize_single_dummy_weight", initialize)
     DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(model, None)
@@ -620,6 +620,17 @@ def test_dummy_loader_visits_local_tensors_once_without_replacing_them(monkeypat
     assert torch.equal(layer.alias, torch.ones_like(layer.weight))
     assert layer.alias.data_ptr() == layer.weight.data_ptr()
     assert layer._non_persistent_buffers_set == {"scratch", "alias"}
+
+
+@pytest.mark.parametrize("online", [False, True])
+def test_dummy_loader_initializes_e8m0_scale_by_name(online):
+    """Both loader paths must initialize byte-stored scales as finite E8M0."""
+    layer = _LateBiasLayer(_RecordingQuantMethod()) if online else torch.nn.Linear(2, 3)
+    layer.register_buffer("weight_scale", torch.zeros(8, dtype=torch.uint8))
+    scale = layer.weight_scale
+    DummyModelLoader(LoadConfig(load_format="dummy")).load_weights(layer, None)
+    assert layer.weight_scale is scale
+    assert scale.tolist() == [120] * 8
 
 
 def test_dummy_loader_preserves_online_materialization_and_quant_processing():
