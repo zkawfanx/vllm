@@ -86,6 +86,12 @@ def tl_rand32(seed, offset, includes_zero: tl.constexpr):
 
 
 @triton.jit
+def spec_step_seed(seed, step):
+    """Mix a speculative step into the high bits of a request seed."""
+    return seed ^ (tl.cast(step, tl.int64) << 32)
+
+
+@triton.jit
 def gumbel_block_argmax(
     logits,
     block,
@@ -141,6 +147,8 @@ def gumbel_block_argmax(
         # Calculate the seed for gumbel noise.
         seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
         pos = tl.load(pos_ptr + token_idx)
+        if processed_logits_ptr is not None:
+            seed = spec_step_seed(seed, col)
         if IS_DRAFTING:
             pos = pos + _DRAFT_NOISE_SALT
         gumbel_seed = tl.randint(seed, pos)

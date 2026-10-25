@@ -260,3 +260,36 @@ def test_draft_stream_salt_preserves_greedy_sampling(is_drafting):
     logits = torch.tensor([0.0, 2.0, 1.0], device=DEVICE)
     sampled = _sample(logits, 32, temperature=0.0, is_drafting=is_drafting)
     assert (sampled == 1).all()
+
+
+@pytest.mark.parametrize("use_fp64", [False, True])
+def test_revisited_position_uses_current_draft_step(use_fp64):
+    """A revisited position gets fresh draft noise when its round step changes."""
+    batch = 4096
+    mapping = torch.arange(batch, dtype=torch.int32, device=DEVICE).flip(0)
+    seeds = torch.arange(batch, dtype=torch.int64, device=DEVICE)
+    positions = torch.full((batch,), 22, dtype=torch.int64, device=DEVICE)
+    logits = torch.tensor([0.7, 0.3], device=DEVICE).log().expand(batch, -1)
+    temperature = torch.ones(batch, device=DEVICE)
+    cache = torch.empty(batch, 2, 2, device=DEVICE)
+
+    def draw(columns):
+        return gumbel_sample(
+            logits,
+            mapping,
+            temperature,
+            seeds,
+            positions,
+            apply_temperature=True,
+            is_drafting=True,
+            output_processed_logits=cache,
+            output_processed_logits_col=columns,
+            use_fp64=use_fp64,
+        )
+
+    step_zero = draw(torch.tensor(0, device=DEVICE))
+    step_one = draw(torch.tensor(1, device=DEVICE))
+    assert torch.equal(step_one, draw(torch.tensor(1, device=DEVICE)))
+    assert 0.35 < (step_zero != step_one).float().mean().item() < 0.5
+    columns = mapping.remainder(2)
+    assert torch.equal(draw(columns), torch.where(columns.bool(), step_one, step_zero))
