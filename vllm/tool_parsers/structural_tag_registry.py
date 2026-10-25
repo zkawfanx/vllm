@@ -9,7 +9,9 @@ from openai.types.responses.response import ToolChoice as ResponsesToolChoice
 from openai.types.responses.tool import Tool as ResponsesTool
 from openai.types.responses.tool_choice_allowed import ToolChoiceAllowed
 from openai.types.responses.tool_choice_function import ToolChoiceFunction
+from pydantic import BaseModel
 from xgrammar import StructuralTag, normalize_tool_choice
+from xgrammar import builtin_structural_tag as xgrammar_builtin_structural_tag
 from xgrammar import get_model_structural_tag as get_xgrammar_model_structural_tag
 from xgrammar.openai_tool_call_schema import (
     BuiltinToolParam,
@@ -27,6 +29,7 @@ from xgrammar.structural_tag import (
     StarFormat,
     TagFormat,
     TagsWithSeparatorFormat,
+    TokenTriggeredTagsFormat,
     TriggeredTagsFormat,
 )
 
@@ -34,6 +37,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
 )
+from vllm.tool_parsers.utils import get_function_tools, require_function_tools
 
 ToolChoice: TypeAlias = (
     Literal["none", "auto", "required"]
@@ -111,6 +115,15 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
+    if model == "deepseek_v41":
+        tools = (
+            get_function_tools(tools)
+            if tool_choice in (None, "auto")
+            else require_function_tools(tools)
+        )
+        if not tools:
+            return None
+
     if tool_choice == "auto" and not _any_tool_strict(tools):
         return None
 
@@ -139,6 +152,33 @@ def get_model_structural_tag(
         tool_choice=dumped_tool_choice,
         reasoning=reasoning,
     )
+
+
+_TOOL_CALL_LIST_FORMATS = (
+    TriggeredTagsFormat,
+    TokenTriggeredTagsFormat,
+    TagsWithSeparatorFormat,
+)
+
+
+def limit_to_single_tool_call(tag: StructuralTag) -> StructuralTag:
+    """Stop every tool-call list in ``tag`` after its first call, in place.
+
+    In registered tags, these list formats repeat calls, never arguments.
+    """
+
+    def visit(node: Any) -> None:
+        if isinstance(node, BaseModel):
+            if isinstance(node, _TOOL_CALL_LIST_FORMATS):
+                node.stop_after_first = True
+            for name in type(node).model_fields:
+                visit(getattr(node, name))
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                visit(item)
+
+    visit(tag.format)
+    return tag
 
 
 def _dump_tool_for_xgrammar(
@@ -230,9 +270,20 @@ def get_deepseek_v41_structural_tag(
     token_suffix: str = "",
 ) -> StructuralTag:
     # Serving enables this visible-text grammar after the reasoning boundary.
+    builder = getattr(
+        xgrammar_builtin_structural_tag, "get_deepseek_v4_1_structural_tag", None
+    )
+    if builder is not None:
+        return builder(
+            tools=tools,
+            builtin_tools=builtin_tools,
+            tool_choice=tool_choice,
+            reasoning="disabled",
+        )
+
     del builtin_tools, reasoning, token_suffix
 
-    # TODO: lower parameter schemas into DSML constraints. This builder constrains
+    # Compatibility with xgrammar releases without the V4.1 builtin. This constrains
     # tool names and DSML/value syntax only. Parameter names, presence, uniqueness
     # and value schemas remain unconstrained, including for strict=true. The request
     # layer still uses strict to decide whether auto tool choice activates a grammar.

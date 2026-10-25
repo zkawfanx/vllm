@@ -5,15 +5,20 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-from xgrammar import Grammar, StructuralTag
+from openai.types.responses import ToolChoiceFunction
+from xgrammar import Grammar, StructuralTag, builtin_structural_tag
 from xgrammar.testing import _is_grammar_accept_string
 
+from vllm import envs
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedFunction,
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
     ChatCompletionToolsParam,
 )
+from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.entrypoints.openai.responses.utils import construct_tool_dicts
+from vllm.exceptions import VLLMValidationError
 from vllm.parser.abstract_parser import DelegatingParser
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
 from vllm.tool_parsers.deepseekv3_tool_parser import DeepSeekV3ToolParser
@@ -22,6 +27,7 @@ from vllm.tool_parsers.deepseekv31_tool_parser import DeepSeekV31ToolParser
 from vllm.tool_parsers.deepseekv32_engine_tool_parser import (
     DeepSeekV32EngineToolParser,
 )
+from vllm.tool_parsers.deepseekv41_engine_tool_parser import DeepSeekV41EngineToolParser
 from vllm.tool_parsers.glm47_moe_tool_parser import Glm47MoeModelToolParser
 from vllm.tool_parsers.hermes_tool_parser import Hermes2ProToolParser
 from vllm.tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
@@ -81,10 +87,14 @@ def test_supported_structural_tag_models_include_vllm_builtins():
 
 
 @pytest.mark.parametrize("choice", ["auto", "required", "get_weather"])
-def test_deepseek_v41_format_constraints_ignore_parameter_schema(
+def test_deepseek_v41_older_xgrammar_keeps_format_constraints(
     choice,
     sample_tools_strict,
+    monkeypatch,
 ):
+    monkeypatch.setattr(
+        builtin_structural_tag, "get_deepseek_v4_1_structural_tag", None, raising=False
+    )
     tool_choice = (
         ChatCompletionNamedToolChoiceParam(
             function=ChatCompletionNamedFunction(name=choice)
@@ -128,7 +138,11 @@ def test_deepseek_v41_named_choice_emits_one_call(sample_tools):
         reasoning=False,
     )
     grammar = Grammar.from_structural_tag(tag)
-    call = '<｜DSML｜ invoke name="get_weather">\n</｜DSML｜ invoke>\n'
+    call = (
+        '<｜DSML｜ invoke name="get_weather">\n'
+        '<｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+    )
     assert _is_grammar_accept_string(
         grammar, "\n\n<｜DSML｜ calls>\n" + call + "</｜DSML｜ calls>"
     )
@@ -139,6 +153,236 @@ def test_deepseek_v41_named_choice_emits_one_call(sample_tools):
         get_model_structural_tag("deepseek_v41", sample_tools, "auto", reasoning=False)
         is None
     )
+
+
+@pytest.mark.skipif(
+    not hasattr(builtin_structural_tag, "get_deepseek_v4_1_structural_tag"),
+    reason="Requires XGrammar's DeepSeek V4.1 builtin",
+)
+@pytest.mark.parametrize("choice", ["auto", "required", "get_weather"])
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_deepseek_v41_constrains_parameters_after_reasoning(
+    sample_tools_strict, choice, reasoning
+):
+    """Strict calls must enforce the schema without requiring another think close."""
+    tool_choice = (
+        ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name=choice)
+        )
+        if choice == "get_weather"
+        else choice
+    )
+    sample_tools_strict[0].function.parameters["additionalProperties"] = False
+    tag = get_model_structural_tag(
+        "deepseek_v41", sample_tools_strict, tool_choice, reasoning=reasoning
+    )
+    grammar = Grammar.from_structural_tag(tag)
+    begin = '\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="get_weather">\n'
+    end = "</｜DSML｜ invoke>\n</｜DSML｜ calls>"
+    parameter = (
+        '<｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>\n'
+    )
+    assert _is_grammar_accept_string(grammar, begin + parameter + end)
+    for invalid in (
+        "",  # missing required city
+        parameter * 2,
+        parameter.replace('name="city"', 'name="unknown"'),
+        parameter.replace('string="true">Paris', 'string="false">42'),
+        parameter.replace("｜ parameter", "｜parameter"),
+        '{"city":"Paris"}',  # the encoder emits DSML parameters, not a JSON body
+    ):
+        assert not _is_grammar_accept_string(grammar, begin + invalid + end)
+    assert not _is_grammar_accept_string(
+        grammar, "reason</think>" + begin + parameter + end
+    )
+    assert _is_grammar_accept_string(grammar, "Hello") == (choice == "auto")
+
+
+@pytest.mark.skipif(
+    not hasattr(builtin_structural_tag, "get_deepseek_v4_1_structural_tag"),
+    reason="Requires XGrammar's DeepSeek V4.1 builtin",
+)
+def test_deepseek_v41_non_strict_parallel_calls_keep_typed_dsml(sample_tools):
+    sample_tools[0].function.strict = False
+    tag = get_model_structural_tag(
+        "deepseek_v41", sample_tools, "required", reasoning=False
+    )
+    grammar = Grammar.from_structural_tag(tag)
+    call = (
+        '<｜DSML｜ invoke name="get_weather">\n'
+        '<｜DSML｜ parameter name="extra" string="false">'
+        '{"nested":[true,null,1.5]}</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+    )
+    output = "\n\n<｜DSML｜ calls>\n" + call * 2 + "</｜DSML｜ calls>"
+    assert _is_grammar_accept_string(grammar, output)
+    assert not _is_grammar_accept_string(
+        grammar, output.replace('{"nested":[true,null,1.5]}', "invalid")
+    )
+
+
+@pytest.fixture
+def v41_request_grammar(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_ENFORCE_STRICT_TOOL_CALLING", True)
+
+    class TestParser(DelegatingParser):
+        tool_parser_cls = DeepSeekV41EngineToolParser
+
+    def compile_request(request):
+        adjusted = TestParser(MagicMock(), tools=request.tools).adjust_request(request)
+        outputs = adjusted.structured_outputs
+        if outputs is None or outputs.structural_tag is None:
+            return None
+        return Grammar.from_structural_tag(outputs.structural_tag)
+
+    return compile_request
+
+
+def _v41_request(api, tools, **kwargs):
+    if api == "chat":
+        return ChatCompletionRequest(model="m", messages=[], tools=tools, **kwargs)
+    return ResponsesRequest.model_validate(
+        {
+            "input": "hi",
+            "tools": [
+                dict(tool.function.model_dump(), type="function") for tool in tools
+            ],
+            **kwargs,
+        }
+    )
+
+
+def _v41_call(name="get_weather"):
+    return (
+        f'<｜DSML｜ invoke name="{name}">\n'
+        '<｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>\n"
+    )
+
+
+_V41_CALLS_BEGIN = "\n\n<｜DSML｜ calls>\n"
+_V41_CALLS_END = "</｜DSML｜ calls>"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("choice", ["auto", "required"])
+def test_v41_single_call_limit_preserves_multiple_parameters(
+    v41_request_grammar, sample_tools_strict, api, choice
+):
+    parameters = sample_tools_strict[0].function.parameters
+    parameters["properties"]["days"] = {"type": "integer"}
+    parameters["required"].append("days")
+    request = _v41_request(
+        api, sample_tools_strict, tool_choice=choice, parallel_tool_calls=False
+    )
+    grammar = v41_request_grammar(request)
+    assert grammar is not None
+    call = _v41_call().replace(
+        "</｜DSML｜ invoke>",
+        '<｜DSML｜ parameter name="days" string="false">2</｜DSML｜ parameter>\n'
+        "</｜DSML｜ invoke>",
+    )
+    one_call = _V41_CALLS_BEGIN + call + _V41_CALLS_END
+    assert _is_grammar_accept_string(grammar, one_call)
+    assert not _is_grammar_accept_string(
+        grammar, _V41_CALLS_BEGIN + call * 2 + _V41_CALLS_END
+    )
+    assert not _is_grammar_accept_string(grammar, one_call + "extra text")
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("parallel", [True, None, "omitted"])
+def test_v41_default_required_grammar_preserves_parallel_calls(
+    v41_request_grammar, sample_tools_strict, api, parallel
+):
+    options = {} if parallel == "omitted" else {"parallel_tool_calls": parallel}
+    grammar = v41_request_grammar(
+        _v41_request(api, sample_tools_strict, tool_choice="required", **options)
+    )
+    assert grammar is not None
+    assert _is_grammar_accept_string(
+        grammar, _V41_CALLS_BEGIN + _v41_call() * 2 + _V41_CALLS_END
+    )
+
+
+@pytest.mark.parametrize("api", ["chat", "responses"])
+def test_v41_single_call_limit_does_not_activate_nonstrict_auto(
+    v41_request_grammar, sample_tools, api
+):
+    request = _v41_request(
+        api, sample_tools, tool_choice="auto", parallel_tool_calls=False
+    )
+    assert v41_request_grammar(request) is None
+
+
+def test_v41_single_call_limit_preserves_environment_gate(
+    v41_request_grammar, sample_tools_strict, monkeypatch
+):
+    monkeypatch.setattr(envs, "VLLM_ENFORCE_STRICT_TOOL_CALLING", False)
+    request = _v41_request(
+        "chat", sample_tools_strict, tool_choice="auto", parallel_tool_calls=False
+    )
+    assert v41_request_grammar(request) is None
+
+
+_MCP_TOOL = {"type": "mcp", "server_label": "docs", "server_url": "http://mcp"}
+
+
+@pytest.mark.parametrize("choice", ["auto", "required"])
+def test_v41_grammar_matches_rendered_function_universe(
+    v41_request_grammar, sample_tools_strict, choice
+):
+    function = dict(sample_tools_strict[0].function.model_dump(), type="function")
+    request = ResponsesRequest.model_validate(
+        {
+            "input": "hi",
+            "tools": [
+                dict(function, strict=False),
+                _MCP_TOOL,
+                {"type": "web_search"},
+                {
+                    "type": "namespace",
+                    "name": "crm",
+                    "description": "",
+                    "tools": [dict(function, name="lookup")],
+                },
+            ],
+            "tool_choice": choice,
+        }
+    )
+    prompt_names = [
+        tool["function"]["name"] for tool in construct_tool_dicts(request.tools, choice)
+    ]
+    assert prompt_names == ["get_weather", "crm__lookup"]
+    grammar = v41_request_grammar(request)
+    assert grammar is not None
+    for name in prompt_names:
+        assert _is_grammar_accept_string(
+            grammar, _V41_CALLS_BEGIN + _v41_call(name) + _V41_CALLS_END
+        )
+    assert not _is_grammar_accept_string(
+        grammar, _V41_CALLS_BEGIN + _v41_call("docs") + _V41_CALLS_END
+    )
+
+
+@pytest.mark.parametrize(
+    "choice", ["auto", "required", ToolChoiceFunction(type="function", name="x")]
+)
+def test_v41_builtin_only_tools_have_no_callable_grammar(choice):
+    request = ResponsesRequest.model_validate(
+        {
+            "input": "hi",
+            "tools": [_MCP_TOOL, {"type": "web_search"}],
+        }
+    )
+    if choice == "auto":
+        assert (
+            get_model_structural_tag("deepseek_v41", request.tools, choice, False)
+            is None
+        )
+    else:
+        with pytest.raises(VLLMValidationError, match="no function tool"):
+            get_model_structural_tag("deepseek_v41", request.tools, choice, False)
 
 
 @pytest.mark.parametrize("model", sorted(XGRAMMAR_BUILTIN_STRUCTURAL_TAG_MODELS))

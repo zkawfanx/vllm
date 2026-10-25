@@ -5,6 +5,7 @@ import ast
 import json
 import math
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass
 from json import JSONDecodeError, JSONDecoder
 from typing import Any, TypeAlias
@@ -28,6 +29,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
 
 Tool: TypeAlias = ChatCompletionToolsParam | ResponsesTool
@@ -181,43 +183,70 @@ def flat_namespace_tool_name(namespace: str, name: str) -> str:
     return f"{namespace}{_NAMESPACE_TOOL_SEPARATOR}{name}"
 
 
+def get_function_tools(
+    tools: Sequence[Tool],
+) -> list[ChatCompletionToolsParam | FunctionTool]:
+    """Return prompt-rendered function tools in request order.
+
+    Namespace functions use ``<namespace>__<name>``. Other Responses tools
+    are not rendered as functions and are omitted.
+    """
+    function_tools: list[ChatCompletionToolsParam | FunctionTool] = []
+    for tool in tools:
+        if isinstance(tool, NamespaceTool):
+            function_tools.extend(
+                FunctionTool.model_validate(
+                    {
+                        **namespaced_tool.model_dump(by_alias=True),
+                        "name": flat_namespace_tool_name(
+                            tool.name, namespaced_tool.name
+                        ),
+                    }
+                )
+                for namespaced_tool in tool.tools
+                if namespaced_tool.type == "function"
+            )
+        elif isinstance(tool, (FunctionTool, ChatCompletionToolsParam)):
+            function_tools.append(tool)
+    return function_tools
+
+
+def require_function_tools(
+    tools: Sequence[Tool],
+) -> list[ChatCompletionToolsParam | FunctionTool]:
+    """Return callable function tools.
+
+    Raises:
+        VLLMValidationError: No function tool can satisfy a required call.
+    """
+    function_tools = get_function_tools(tools)
+    if not function_tools:
+        raise VLLMValidationError(
+            "tool_choice requires a function call, but tools contains no "
+            "function tool the model can call.",
+            parameter="tool_choice",
+        )
+    return function_tools
+
+
 def iter_response_function_tool_info(
     tool: ResponsesTool,
 ) -> list[tuple[str, dict[str, Any] | None]]:
-    if isinstance(tool, FunctionTool):
-        return [(tool.name, tool.parameters)]
-    if not isinstance(tool, NamespaceTool):
-        return []
-
-    namespace = tool.name
     return [
-        (
-            flat_namespace_tool_name(namespace, namespaced_tool.name),
-            namespaced_tool.parameters,
-        )
-        for namespaced_tool in tool.tools
-        if namespaced_tool.type == "function"
+        (function_tool.name, function_tool.parameters)
+        for function_tool in get_function_tools([tool])
+        if isinstance(function_tool, FunctionTool)
     ]
 
 
 def iter_response_function_tool_dicts(
     tools: list[ResponsesTool],
 ) -> list[dict[str, Any]]:
-    function_tools: list[dict[str, Any]] = []
-    for tool in tools:
-        if isinstance(tool, NamespaceTool):
-            namespace = tool.name
-            for namespaced_tool in tool.tools:
-                if namespaced_tool.type != "function":
-                    continue
-                tool_dict = namespaced_tool.model_dump()
-                tool_dict["name"] = flat_namespace_tool_name(
-                    namespace, namespaced_tool.name
-                )
-                function_tools.append(tool_dict)
-        elif isinstance(tool, FunctionTool):
-            function_tools.append(tool.model_dump())
-    return function_tools
+    return [
+        tool.model_dump()
+        for tool in get_function_tools(tools)
+        if isinstance(tool, FunctionTool)
+    ]
 
 
 def build_responses_tool_call_name_map(
@@ -366,21 +395,11 @@ def _get_tool_schema_defs(
 
 def _get_json_schema_from_tools(
     tools: list[Tool],
+    parallel_tool_calls: bool | None = None,
 ) -> dict:
-    fn_tool_schemas: list[dict[str, Any]] = []
-    fn_tools: list[Tool] = []
-    for tool in tools:
-        if isinstance(tool, (FunctionTool, NamespaceTool)):
-            fn_tool_schemas.extend(
-                _get_tool_schema_from_name_and_params(name, params)
-                for name, params in iter_response_function_tool_info(tool)
-            )
-            if isinstance(tool, FunctionTool):
-                fn_tools.append(tool)
-        elif _is_function_tool(tool):
-            fn_tool_schemas.append(_get_tool_schema_from_tool(tool))
-            fn_tools.append(tool)
-    json_schema = {
+    fn_tools: list[Tool] = list(require_function_tools(tools))
+    fn_tool_schemas = [_get_tool_schema_from_tool(tool) for tool in fn_tools]
+    json_schema: dict[str, Any] = {
         "type": "array",
         "minItems": 1,
         "items": {
@@ -388,6 +407,10 @@ def _get_json_schema_from_tools(
             "anyOf": fn_tool_schemas,
         },
     }
+    # Only an explicit `false` opts out of parallel tool calls; `None` means the
+    # field was never set and the default (true) applies.
+    if parallel_tool_calls is False:
+        json_schema["maxItems"] = 1
     json_schema_defs = _get_tool_schema_defs(fn_tools)
     if json_schema_defs:
         json_schema["$defs"] = json_schema_defs
@@ -397,6 +420,7 @@ def _get_json_schema_from_tools(
 def get_json_schema_from_tools(
     tool_choice: str | ToolChoiceFunction | ChatCompletionNamedToolChoiceParam,
     tools: list[Tool] | None,
+    parallel_tool_calls: bool | None = None,
 ) -> str | dict | None:
     # tool_choice: "none"
     if tool_choice in ("none", None) or tools is None:
@@ -432,7 +456,7 @@ def get_json_schema_from_tools(
         return chat_tool_map[tool_name].function.parameters
     # tool_choice: "required"
     if tool_choice == "required":
-        return _get_json_schema_from_tools(tools)
+        return _get_json_schema_from_tools(tools, parallel_tool_calls)
     # tool_choice: "auto"
     return None
 
