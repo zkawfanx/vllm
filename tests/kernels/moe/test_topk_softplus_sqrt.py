@@ -407,3 +407,105 @@ def test_fused_topk_softplus_sqrt_padding(
     sorted_w_ref = topk_weights_ref[rows_to_compare].gather(1, idx_ref)
     sorted_w = topk_weights[rows_to_compare].gather(1, idx_ops)
     torch.testing.assert_close(sorted_w_ref, sorted_w, atol=2e-2, rtol=1e-2)
+
+
+def _vision_routing_reference(
+    logits, bias, bias_vl, tokens, padding, topk, renormalize
+):
+    scores = F.softplus(logits.float()).sqrt()
+    image = (tokens >= 129264) & (tokens < 129269)
+    ids = (scores + torch.where(image[:, None], bias_vl, bias)).topk(topk).indices
+    weights = scores.gather(1, ids)
+    if renormalize:
+        weights /= weights.sum(-1, keepdim=True)
+    weights *= 1.5
+    return weights.masked_fill(padding[:, None], 0), ids.masked_fill(
+        padding[:, None], -1
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("num_experts,topk", [(128, 3), (384, 6)])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("strided_bias", [False, True])
+def test_v41_vision_routing_bias_and_padding(
+    monkeypatch, device, num_experts, topk, renormalize, strided_bias
+):
+    """Image bias changes selection only; strided biases retain fallback semantics."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA execution unavailable")
+    from vllm.model_executor.layers.fused_moe.router import fused_topk_bias_router
+
+    logits = torch.linspace(-2, 2, 7 * num_experts, device=device).view(7, num_experts)
+    bias = torch.linspace(-1, 1, 2 * num_experts, device=device)[::2]
+    if not strided_bias:
+        bias = bias.contiguous()
+    bias_vl = -bias.contiguous()
+    tokens = torch.arange(129263, 129270, device=device)
+    padding = torch.tensor(
+        [False, False, True, False, False, False, True], device=device
+    )
+    logits[0] = -100.0
+    logits[padding] = float("nan")
+    monkeypatch.setattr(fused_topk_bias_router, "_get_padding_mask", lambda _: padding)
+
+    actual = fused_topk_bias(
+        logits,
+        logits,
+        "sqrtsoftplus",
+        bias,
+        topk,
+        renormalize,
+        indices_type=torch.int64,
+        input_tokens=tokens,
+        routed_scaling_factor=1.5,
+        bias_vl=bias_vl,
+        image_sentinel_lo=129264,
+    )
+    expected = _vision_routing_reference(
+        logits, bias, bias_vl, tokens, padding, topk, renormalize
+    )
+    torch.testing.assert_close(actual[0], expected[0], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(actual[1], expected[1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")
+@pytest.mark.parametrize("num_experts,topk", [(128, 3), (384, 6)])
+def test_v41_vision_routing_graph_replay(monkeypatch, num_experts, topk):
+    """Replay must read updated image IDs and padding instead of capture-time values."""
+    from vllm.model_executor.layers.fused_moe.router import fused_topk_bias_router
+
+    logits = torch.linspace(-2, 2, 7 * num_experts, device="cuda").view(7, num_experts)
+    bias = torch.linspace(-1, 1, num_experts, device="cuda")
+    bias_vl = -bias
+    tokens = torch.arange(129263, 129270, device="cuda")
+    padding = torch.zeros(7, dtype=torch.bool, device="cuda")
+    monkeypatch.setattr(fused_topk_bias_router, "_get_padding_mask", lambda _: padding)
+
+    def route():
+        return fused_topk_bias(
+            logits,
+            logits,
+            "sqrtsoftplus",
+            bias,
+            topk,
+            True,
+            input_tokens=tokens,
+            routed_scaling_factor=1.5,
+            bias_vl=bias_vl,
+            image_sentinel_lo=129264,
+        )
+
+    route()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        weights, ids = route()
+    for shift in (1, -2):
+        tokens.add_(shift)
+        padding.logical_not_()
+        graph.replay()
+        expected = _vision_routing_reference(
+            logits, bias, bias_vl, tokens, padding, topk, True
+        )
+        torch.testing.assert_close(weights, expected[0], atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(ids.long(), expected[1])

@@ -82,6 +82,9 @@ def _topk_softplus_sqrt_torch(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    *,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Pure PyTorch fallback for topk_softplus_sqrt (XPU/CPU)."""
     # scores = sqrt(softplus(gating_output))
@@ -94,6 +97,15 @@ def _topk_softplus_sqrt_torch(
         scores_for_choice = scores + e_score_correction_bias.float()
     else:
         scores_for_choice = scores
+
+    if bias_vl is not None and image_sentinel_lo > 0:
+        assert input_tokens is not None and hash_indices_table is None
+        image_mask = (input_tokens >= image_sentinel_lo) & (
+            input_tokens < image_sentinel_lo + 5
+        )
+        scores_for_choice = torch.where(
+            image_mask[:, None], scores + bias_vl.float(), scores_for_choice
+        )
 
     topk = topk_weights.shape[-1]
 
@@ -112,7 +124,11 @@ def _topk_softplus_sqrt_torch(
         weights = scores.gather(1, indices)
 
     if renormalize:
-        weights = weights / (weights.sum(dim=-1, keepdim=True).clamp(min=1e-20))
+        weight_sum = weights.sum(dim=-1, keepdim=True)
+        if bias_vl is not None and image_sentinel_lo > 0:
+            weights = weights / torch.where(weight_sum > 0, weight_sum, 1.0)
+        else:
+            weights = weights / weight_sum.clamp(min=1e-20)
 
     topk_weights.copy_(weights * routed_scaling_factor)
     return topk_weights, topk_indices
@@ -184,7 +200,82 @@ def fused_topk_bias(
     input_tokens: torch.Tensor | None = None,
     hash_indices_table: torch.Tensor | None = None,
     routed_scaling_factor: float = 1.0,
+    *,
+    bias_vl: torch.Tensor | None = None,
+    image_sentinel_lo: int = 0,
 ):
+    if bias_vl is not None and image_sentinel_lo > 0:
+        if input_tokens is None:
+            raise ValueError("Vision MoE routing requires input_ids.")
+        if scoring_func != "sqrtsoftplus" or hash_indices_table is not None:
+            raise ValueError(
+                "Vision MoE requires sqrtsoftplus routing without hashing."
+            )
+        output_dtype = torch.int32 if indices_type is None else indices_type
+        num_tokens, num_experts = gating_output.shape
+        assert input_tokens.shape == (num_tokens,)
+        assert input_tokens.dtype in (torch.int32, torch.int64)
+        assert input_tokens.device == gating_output.device
+        for bias in (e_score_correction_bias, bias_vl):
+            if bias is not None:
+                assert bias.shape == (num_experts,)
+                assert bias.device == gating_output.device
+        is_padding = _get_padding_mask(num_tokens)
+        if is_padding is not None:
+            assert output_dtype in (torch.int32, torch.int64)
+        from vllm.platforms import current_platform
+
+        if (
+            current_platform.is_cuda()
+            and gating_output.is_cuda
+            and gating_output.dtype == torch.float32
+            and gating_output.is_contiguous()
+            and (gating_output.shape[1], topk) in ((128, 3), (384, 6))
+            and output_dtype in (torch.int32, torch.int64)
+            and (
+                e_score_correction_bias is None
+                or (
+                    e_score_correction_bias.dtype == torch.float32
+                    and e_score_correction_bias.is_contiguous()
+                )
+            )
+            and bias_vl.dtype == torch.float32
+            and bias_vl.is_contiguous()
+            and input_tokens.is_contiguous()
+        ):
+            return dsv4_topk(
+                gating_output,
+                e_score_correction_bias,
+                output_dtype,
+                routed_scaling_factor,
+                is_padding=is_padding,
+                topk=topk,
+                renormalize=renormalize,
+                bias_vl=bias_vl,
+                input_tokens=input_tokens,
+                image_sentinel_lo=image_sentinel_lo,
+            )
+        shape = (gating_output.shape[0], topk)
+        weights = gating_output.new_empty(shape, dtype=torch.float32)
+        ids = gating_output.new_empty(shape, dtype=output_dtype)
+        _topk_softplus_sqrt_torch(
+            weights,
+            ids,
+            ids,
+            gating_output,
+            renormalize,
+            e_score_correction_bias,
+            input_tokens,
+            None,
+            routed_scaling_factor,
+            bias_vl=bias_vl,
+            image_sentinel_lo=image_sentinel_lo,
+        )
+        if is_padding is not None:
+            weights.masked_fill_(is_padding[:, None], 0.0)
+            ids.masked_fill_(is_padding[:, None], -1)
+        return weights, ids
+
     if (
         input_tokens is not None
         and hash_indices_table is not None
@@ -420,6 +511,8 @@ class FusedTopKBiasRouter(BaseRouter):
             input_tokens=input_ids,
             hash_indices_table=self._hash_indices_table,
             routed_scaling_factor=self.routed_scaling_factor,
+            bias_vl=self.bias_vl,
+            image_sentinel_lo=self.image_sentinel_lo,
         )
 
         if self.num_fused_shared_experts > 0:

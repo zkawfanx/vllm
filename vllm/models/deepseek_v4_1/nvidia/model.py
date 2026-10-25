@@ -109,6 +109,9 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
             num_hash_layers=0,
             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
         )
+        if not self.use_mega_moe:
+            self.experts.router.bias_vl = self.gate.bias_vl
+            self.experts.router.image_sentinel_lo = self.image_sentinel_lo
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
