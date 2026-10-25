@@ -412,7 +412,7 @@ def test_fused_topk_softplus_sqrt_padding(
 def _vision_routing_reference(
     logits, bias, bias_vl, tokens, padding, topk, renormalize
 ):
-    scores = F.softplus(logits.float()).sqrt()
+    scores = F.softplus(logits.double()).sqrt().float()
     image = (tokens >= 129264) & (tokens < 129269)
     ids = (scores + torch.where(image[:, None], bias_vl, bias)).topk(topk).indices
     weights = scores.gather(1, ids)
@@ -445,7 +445,7 @@ def test_v41_vision_routing_bias_and_padding(
     padding = torch.tensor(
         [False, False, True, False, False, False, True], device=device
     )
-    logits[0] = -100.0
+    logits[0] = -110.0
     logits[padding] = float("nan")
     monkeypatch.setattr(fused_topk_bias_router, "_get_padding_mask", lambda _: padding)
 
@@ -467,6 +467,7 @@ def test_v41_vision_routing_bias_and_padding(
     )
     torch.testing.assert_close(actual[0], expected[0], atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(actual[1], expected[1])
+    torch.testing.assert_close(actual[0][0], expected[0][0], atol=0, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")

@@ -89,6 +89,9 @@ def _topk_softplus_sqrt_torch(
     """Pure PyTorch fallback for topk_softplus_sqrt (XPU/CPU)."""
     # scores = sqrt(softplus(gating_output))
     scores = torch.sqrt(F.softplus(gating_output.float()))
+    if bias_vl is not None and image_sentinel_lo > 0:
+        logits = gating_output.float()
+        scores = torch.where(logits < -20.0, torch.exp(logits * 0.5), scores)
 
     # Bias is used for expert SELECTION only, not for weight computation.
     # Using biased scores as weights flattens the distribution when the bias
