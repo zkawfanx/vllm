@@ -9,6 +9,7 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     _torch_hc_prenorm_gemm,
     mhc_pre_broadcast_tilelang,
 )
+from vllm.model_executor.kernels.mhc.triton import hc_collapse_triton
 from vllm.model_executor.layers.mhc import HAS_TILELANG_MHC
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
@@ -383,9 +384,7 @@ def test_prenorm_router_drops_sqrsum_when_already_produced(monkeypatch, sqrsum_r
 
     from vllm.model_executor.kernels.mhc import tilelang as tl_mod
 
-    mhc_triton = importlib.import_module(
-        "vllm.model_executor.kernels.mhc.triton"
-    )
+    mhc_triton = importlib.import_module("vllm.model_executor.kernels.mhc.triton")
 
     seen = {}
 
@@ -422,9 +421,14 @@ def test_prenorm_shard_requires_the_sqrsum_fold(monkeypatch):
     monkeypatch.setattr(mhc_triton.envs, "VLLM_MHC_PRENORM_SHARD", True)
 
     reached = []
+
+    def model_parallel_is_initialized():
+        reached.append(True)
+        return False
+
     monkeypatch.setattr(
         "vllm.distributed.parallel_state.model_parallel_is_initialized",
-        lambda: reached.append(True) or False,
+        model_parallel_is_initialized,
     )
 
     # Real device tensors: the not-None branch runs _row_sqrsum_kernel for
@@ -475,9 +479,7 @@ def test_prenorm_shard_rows_partition_exactly(num_tokens, tp_size):
 @pytest.mark.parametrize("num_tokens", [1, 4, 128, 2048])
 @pytest.mark.parametrize("hidden_size", [4096, 7168])
 @pytest.mark.parametrize("hc_mult", [4])
-def test_mhc_post_sqrsum_matches_standalone_reduction(
-    num_tokens, hidden_size, hc_mult
-):
+def test_mhc_post_sqrsum_matches_standalone_reduction(num_tokens, hidden_size, hc_mult):
     """The fused sqrsum must equal the separate pass it replaces.
 
     Above the cuBLAS crossover the prenorm GEMM's companion reduction is a
@@ -667,3 +669,24 @@ def test_hc_head_tilelang(num_tokens, hidden_size, hc_mult):
 
     out_ref = hc_head_ref(residual, fn, hc_scale, hc_base, rms_eps, hc_eps)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("num_tokens", [1, 7, 32])
+@pytest.mark.parametrize("tp_size", [4, 8])
+def test_hc_collapse_before_gather_is_bitwise_equal(num_tokens, tp_size):
+    """Simulate SP on one GPU, including padding and ranks without valid tokens."""
+    set_random_seed(0)
+    padded_tokens = num_tokens + (-num_tokens) % tp_size
+    streams = torch.randn(padded_tokens, 4, 5120, dtype=torch.bfloat16, device=DEVICE)
+    pre_mix = torch.rand(padded_tokens, 4, device=DEVICE)
+    stream_shards = streams.chunk(tp_size)
+    mix_shards = pre_mix.chunk(tp_size)
+    before = hc_collapse_triton(
+        torch.cat(stream_shards)[:num_tokens], torch.cat(mix_shards)[:num_tokens]
+    )
+    after = torch.cat(
+        [hc_collapse_triton(x, pre) for x, pre in zip(stream_shards, mix_shards)]
+    )[:num_tokens]
+    assert after.shape == (num_tokens, 5120)
+    torch.testing.assert_close(after, before, atol=0, rtol=0)
