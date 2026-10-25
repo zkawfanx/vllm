@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,9 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.entrypoints.chat_utils import parse_chat_messages
+from vllm.renderers.params import ChatParams
 from vllm.renderers.registry import RENDERER_REGISTRY
 from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
 from vllm.tokenizers.registry import TokenizerRegistry
+from vllm.utils.async_utils import make_async
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures" / "deepseek_v4"
 
@@ -83,6 +86,31 @@ def test_deepseek_v4_defaults_to_chat_mode():
     )
 
     assert prompt == ("<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>")
+
+
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("tokenize", [False, True])
+def test_deepseek_v4_renderer_preserves_prompt_output(use_async, tokenize):
+    cls = RENDERER_REGISTRY.load_renderer_cls("deepseek_v4")
+    renderer = cls.__new__(cls)
+    renderer.model_config = _model_config()
+    renderer.tokenizer = _tokenizer()
+    renderer._apply_chat_template_async = make_async(renderer._apply_chat_template)
+    messages = [{"role": "user", "content": "Hello"}]
+    params = ChatParams(chat_template_kwargs={"tokenize": tokenize})
+
+    if use_async:
+        conversation, prompt = asyncio.run(
+            renderer.render_messages_async(messages, params)
+        )
+    else:
+        conversation, prompt = renderer.render_messages(messages, params)
+
+    expected = "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜></think>"
+    assert conversation == messages
+    assert prompt == (
+        {"prompt_token_ids": [len(expected)]} if tokenize else {"prompt": expected}
+    )
 
 
 @pytest.mark.parametrize("kwargs", [{"thinking": True}, {"enable_thinking": True}])
