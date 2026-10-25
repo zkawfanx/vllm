@@ -331,3 +331,148 @@ def test_flashinfer_sparse_indices_cache(monkeypatch):
     assert builder_calls == 4
     assert sparse_indices_third is not sparse_indices_fourth
     assert sparse_lens_third is not sparse_lens_fourth
+
+
+def _make_v41_swa_builder(device, num_tokens, vision_n_layers=2):
+    from types import SimpleNamespace
+
+    from vllm.models.deepseek_v4_1.sparse_mla import (
+        DeepseekV41SparseSWAMetadataBuilder,
+    )
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            max_model_len=4096,
+            hf_config=DeepseekV41Config(
+                text_config={
+                    "sliding_window": 128,
+                    "compress_ratios": [0, 1, 2],
+                    "index_topk": 8,
+                },
+                vision_config={
+                    "num_hidden_layers": vision_n_layers,
+                    "max_image_tokens": 2048,
+                },
+            ),
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=num_tokens),
+        speculative_config=None,
+    )
+    spec = SlidingWindowMLASpec(
+        block_size=64,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.bfloat16,
+        sliding_window=128,
+        cache_dtype_str="auto",
+        model_version="deepseek_v4",
+    )
+    return DeepseekV41SparseSWAMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["layer0"],
+        vllm_config=config,
+        device=device,
+    )
+
+
+@pytest.mark.cpu_test
+def test_v41_image_swa_metadata_and_warmup_match_text():
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+        CombineTopkSwaIndicesKernel,
+    )
+
+    image_builder = _make_v41_swa_builder(torch.device("cpu"), 100)
+    text_builder = _make_v41_swa_builder(torch.device("cpu"), 100, vision_n_layers=0)
+    assert image_builder.max_image_tokens == text_builder.max_image_tokens == 0
+    assert image_builder.prefill_index_width == text_builder.prefill_index_width == 128
+    kernel = CombineTopkSwaIndicesKernel()
+    image_keys = kernel.get_warmup_keys(image_builder.vllm_config)
+    assert image_keys == kernel.get_warmup_keys(text_builder.vllm_config)
+    assert {key.COMPRESS_RATIO for key in image_keys} == {0, 1, 2}
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 1, 2])
+@pytest.mark.parametrize("query_len", [100, 4000])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_v41_image_prefill_indices_are_causal(compress_ratio, query_len, mixed):
+    """Full/chunked image prefills agree in gathered and paged sparse indices."""
+    if not torch.accelerator.is_available():
+        pytest.skip("requires CUDA or ROCm")
+    from tests.v1.attention.utils import BatchSpec, create_common_attn_metadata
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+        build_flashinfer_mixed_sparse_indices,
+        combine_topk_swa_indices,
+    )
+
+    device = torch.device("cuda")
+    num_decode = int(mixed)
+    seq_len, window = 4000, 128
+    builder = _make_v41_swa_builder(device, query_len + num_decode)
+    common = create_common_attn_metadata(
+        BatchSpec(
+            seq_lens=([10] if mixed else []) + [seq_len],
+            query_lens=([1] if mixed else []) + [query_len],
+        ),
+        block_size=64,
+        device=device,
+        arange_block_indices=True,
+    )
+    common.mm_req_doc_ranges = {num_decode: [(1900, 3947)]}
+    md = builder.build(0, common)
+    assert builder.max_image_tokens == 0
+    assert md.prefill_left_visible is md.prefill_right_visible is None
+    assert md.prefill_swa_indices.shape[-1] == window
+    [(start, end, n, m)] = md.get_prefill_chunk_plan(
+        compress_ratio, prefill_chunk_size=4, has_compressed=compress_ratio > 0
+    )
+    gather_len = int(md.prefill_gather_lens[0])
+    assert (start, end, m - n) == (0, 1, gather_len)
+    assert gather_len == query_len + min(seq_len - query_len, window - 1)
+    topk = torch.empty(query_len, 0, dtype=torch.int32, device=device)
+    indices, lens = combine_topk_swa_indices(
+        topk,
+        md.query_start_loc[num_decode:],
+        md.prefill_seq_lens,
+        md.prefill_gather_lens,
+        window,
+        compress_ratio,
+        0,
+        m,
+        n,
+    )
+    mixed_indices, mixed_lens = build_flashinfer_mixed_sparse_indices(
+        md.decode_swa_indices[:, 0],
+        None,
+        None,
+        topk,
+        md.query_start_loc,
+        md.seq_lens,
+        md.token_to_req_indices,
+        md.block_table,
+        md.block_size,
+        None,
+        md.block_size,
+        window,
+        compress_ratio,
+        0,
+    )
+    indices, lens = indices.cpu(), lens.cpu().tolist()
+    paged_indices = md.prefill_swa_indices[:, 0].cpu()
+    paged_lens = md.prefill_swa_lens.cpu().tolist()
+    mixed_indices = mixed_indices.cpu()
+    assert mixed_lens.cpu().tolist() == [window] * (query_len + num_decode)
+    if mixed:
+        assert torch.equal(mixed_indices[0], md.decode_swa_indices[0, 0].cpu())
+    page_base = int(md.block_table[num_decode, 0]) * md.block_size
+    for token, pos in enumerate(range(seq_len - query_len, seq_len)):
+        lo, hi = max(0, pos - window + 1), pos + 1
+        row = indices[token, : lens[token]]
+        assert lens[token] == paged_lens[token] == hi - lo
+        assert torch.all((row >= n) & (row < m))
+        assert (row - n + seq_len - gather_len).tolist() == list(range(lo, hi))
+        expected_slots = list(range(page_base + lo, page_base + hi))
+        assert paged_indices[token, : hi - lo].tolist() == expected_slots
+        assert mixed_indices[num_decode + token, : hi - lo].tolist() == expected_slots
+        assert torch.all(mixed_indices[num_decode + token, hi - lo :] == -1)

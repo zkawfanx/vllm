@@ -457,7 +457,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         self.window_size = hf_config.sliding_window
         self.max_image_tokens = (
             getattr(hf_config, "vision_max_n_token", 0)
-            if getattr(hf_config, "vision_n_layers", 0) > 0
+            if getattr(hf_config, "mm_prefix_clamp_sliding_window", False)
             else 0
         )
         self.prefill_index_width = self.window_size + self.max_image_tokens
