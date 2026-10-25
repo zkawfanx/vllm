@@ -85,7 +85,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
         self.sample_idx_mapping = torch.zeros(
-            max_num_sampled_tokens, dtype=torch.int32, device=device
+            max_num_sampled_tokens, dtype=torch.int64, device=device
         )
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].

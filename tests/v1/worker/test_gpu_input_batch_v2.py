@@ -6,7 +6,9 @@ import pytest
 import torch
 
 from vllm.platforms import current_platform
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, post_update
+from vllm.v1.worker.gpu.sample.penalties import bincount
 
 DEVICE = current_platform.device_type
 
@@ -51,3 +53,103 @@ def test_make_dummy_distributes_remainder(num_reqs: int, num_tokens: int):
     assert torch.equal(
         batch.query_start_loc.cpu(), torch.from_numpy(batch.query_start_loc_np)
     )
+
+
+@pytest.mark.cpu_test
+def test_dummy_request_indices_preserve_large_row_offsets():
+    buffers = InputBuffers(3, 3, device=torch.device("cpu"))
+    batch = InputBatch.make_dummy(3, 3, buffers)
+    stride = 2**30
+    expected = [0, stride, 2 * stride]
+    assert (batch.idx_mapping * stride).tolist() == expected
+    assert (batch.expanded_idx_mapping * stride).tolist() == expected
+    assert (batch.idx_mapping_np * stride).tolist() == expected
+    assert batch.expanded_local_pos.dtype == torch.int32
+
+
+_ROW_STRIDE = 2**20
+_HIGH_ROW = 2**11
+_NUM_ROWS = _HIGH_ROW + 1
+
+
+@pytest.fixture(scope="module")
+def high_row_device():
+    if not current_platform.is_cuda_alike():
+        pytest.skip("requires CUDA or ROCm")
+    required_bytes = _NUM_ROWS * _ROW_STRIDE * 4 + 2**30
+    if torch.accelerator.get_memory_info(0)[0] < required_bytes:
+        pytest.skip("requires 9 GiB free device memory for int32 row overflow")
+    return torch.device("cuda:0")
+
+
+@pytest.fixture
+def high_row_inputs(high_row_device):
+    tokens = torch.zeros(
+        (_NUM_ROWS, _ROW_STRIDE), dtype=torch.int32, device=high_row_device
+    )
+    buffers = InputBuffers(_NUM_ROWS, _NUM_ROWS, device=high_row_device)
+    batch = InputBatch.make_dummy(_NUM_ROWS, _NUM_ROWS, buffers)
+    return tokens, batch.idx_mapping[[0, _HIGH_ROW]]
+
+
+def test_staged_write_preserves_large_row_offsets(high_row_device):
+    """An int32 staged index must not wrap when multiplied by its row stride."""
+    staged = StagedWriteTensor((_NUM_ROWS, _ROW_STRIDE), torch.int32, high_row_device)
+    staged.stage_write(0, 1, [11, 12])
+    staged.stage_write(_HIGH_ROW, 1, [21, 22])
+    staged.apply_write()
+    assert staged.gpu[0, :4].tolist() == [0, 11, 12, 0]
+    assert staged.gpu[_HIGH_ROW, :4].tolist() == [0, 21, 22, 0]
+
+
+def test_post_update_preserves_large_row_offsets_and_skips_padding(high_row_inputs):
+    tokens, idx_mapping = high_row_inputs
+    device = tokens.device
+    idx_mapping = torch.cat((idx_mapping, idx_mapping.new_tensor([-1])))
+    num_computed = torch.zeros(_NUM_ROWS, dtype=torch.int32, device=device)
+    last_sampled = torch.full((_NUM_ROWS,), -1, dtype=torch.int64, device=device)
+    total_len = torch.zeros(_NUM_ROWS, dtype=torch.int32, device=device)
+    total_len[[0, _HIGH_ROW]] = torch.tensor(
+        [50, 100], dtype=torch.int32, device=device
+    )
+    post_update(
+        idx_mapping,
+        num_computed,
+        last_sampled,
+        None,
+        torch.tensor([[111], [222], [333]], dtype=torch.int64, device=device),
+        torch.ones(3, dtype=torch.int32, device=device),
+        torch.zeros(3, dtype=torch.int32, device=device),
+        torch.arange(4, dtype=torch.int32, device=device),
+        tokens,
+        total_len,
+    )
+    assert tokens[0, 50].item() == 111
+    assert tokens[_HIGH_ROW, 100].item() == 222
+    assert last_sampled[[0, _HIGH_ROW]].tolist() == [111, 222]
+    assert total_len[[0, _HIGH_ROW]].tolist() == [51, 101]
+    assert num_computed[[0, _HIGH_ROW]].tolist() == [1, 1]
+    assert tokens[1].count_nonzero().item() == 0
+
+
+def test_penalty_counts_preserve_large_row_offsets(high_row_inputs):
+    tokens, idx_mapping = high_row_inputs
+    device = tokens.device
+    tokens[0, :4] = tokens.new_tensor([1, 2, 3, 3])
+    tokens[_HIGH_ROW, :4] = tokens.new_tensor([1, 2, 3, 3])
+    prompt_len = torch.full((_NUM_ROWS,), 2, dtype=torch.int32, device=device)
+    prefill_len = torch.full((_NUM_ROWS,), 4, dtype=torch.int32, device=device)
+    prompt_mask = torch.zeros((_NUM_ROWS, 1), dtype=torch.int32, device=device)
+    output_counts = torch.zeros((_NUM_ROWS, 32), dtype=torch.int32, device=device)
+    bincount(
+        idx_mapping,
+        tokens,
+        prompt_len,
+        prefill_len,
+        prompt_mask,
+        output_counts,
+        max_prefill_len=4,
+    )
+    assert prompt_mask[[0, _HIGH_ROW], 0].tolist() == [6, 6]
+    assert output_counts[[0, _HIGH_ROW], 3].tolist() == [2, 2]
+    assert output_counts.sum().item() == 4

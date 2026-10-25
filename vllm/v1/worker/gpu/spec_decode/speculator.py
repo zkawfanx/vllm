@@ -111,7 +111,7 @@ class DraftModelSpeculator(BaseSpeculator):
             device=device,
         )
         self.idx_mapping = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device=device
+            self.max_num_reqs, dtype=torch.int64, device=device
         )
         self.temperature = torch.zeros(
             self.max_num_reqs, dtype=torch.float32, device=device
@@ -284,8 +284,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 "avoids materializing."
             )
         missing = [
-            name for name in self._local_argmax_hooks
-            if not hasattr(self.model, name)
+            name for name in self._local_argmax_hooks if not hasattr(self.model, name)
         ]
         if missing:
             raise ValueError(

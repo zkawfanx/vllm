@@ -57,7 +57,7 @@ class PenaltiesState:
         if self._new_penalties_reqs:
             idx_mapping = async_tensor_h2d(
                 self._new_penalties_reqs,
-                dtype=torch.int32,
+                dtype=torch.int64,
                 device=self.device,
             )
 
