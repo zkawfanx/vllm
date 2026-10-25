@@ -818,6 +818,7 @@ def _resample_kernel(
         0,  # processed_logits_stride
         None,  # processed_logits_col_ptr
         vocab_size,
+        IS_DRAFTING=False,
         APPLY_TEMPERATURE=False,
         USE_FP64=USE_FP64,
     )

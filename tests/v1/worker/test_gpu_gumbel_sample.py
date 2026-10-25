@@ -54,6 +54,7 @@ def _sample(
     *,
     use_fp64: bool = False,
     temperature: float = 1.0,
+    is_drafting: bool = False,
 ) -> torch.Tensor:
     """Sample `num_samples` tokens from one logit vector.
 
@@ -74,6 +75,7 @@ def _sample(
         seed,
         pos,
         apply_temperature=True,
+        is_drafting=is_drafting,
         use_fp64=use_fp64,
     )
 
@@ -101,7 +103,13 @@ def _sample_histogram(
         seed = torch.tensor([0xABCD], dtype=torch.int64, device=DEVICE)
         pos = torch.arange(start, start + size, dtype=torch.int64, device=DEVICE)
         out = gumbel_sample(
-            logits, idx_mapping, temp, seed, pos, apply_temperature=True
+            logits,
+            idx_mapping,
+            temp,
+            seed,
+            pos,
+            apply_temperature=True,
+            is_drafting=False,
         )
         hist += torch.bincount(out, minlength=vocab_size).double()
     return hist
@@ -178,7 +186,7 @@ def test_greedy_temperature_zero_returns_argmax():
     pos = torch.arange(num_reqs, dtype=torch.int64, device=DEVICE)
 
     sampled = gumbel_sample(
-        logits, idx_mapping, temp, seed, pos, apply_temperature=True
+        logits, idx_mapping, temp, seed, pos, apply_temperature=True, is_drafting=False
     )
     assert torch.equal(sampled, logits.argmax(dim=-1))
 
@@ -225,3 +233,30 @@ def test_vocab_size_not_multiple_of_block(vocab_size: int):
     df = vocab_size - 1
     if df >= 1:
         assert chi2 < df + 10 * math.sqrt(2 * df), f"chi2={chi2:.1f}, df={df}"
+
+
+@pytest.mark.parametrize("use_fp64", [False, True])
+def test_drafting_uses_a_separate_reproducible_noise_stream(use_fp64):
+    """Independent proposals prevent residual sampling from inheriting bias."""
+    num_samples = 8192
+    logits = torch.zeros(16, device=DEVICE)
+    target = _sample(logits, num_samples, use_fp64=use_fp64)
+    draft = _sample(logits, num_samples, use_fp64=use_fp64, is_drafting=True)
+
+    # Independent uniform streams agree only about 1/16 of the time.
+    assert (target != draft).float().mean().item() > 0.85
+    assert torch.equal(
+        draft, _sample(logits, num_samples, use_fp64=use_fp64, is_drafting=True)
+    )
+    for sampled in (target, draft):
+        counts = torch.bincount(sampled, minlength=16).float()
+        assert (
+            (counts - num_samples / 16).abs() < 8 * math.sqrt(num_samples / 16)
+        ).all()
+
+
+@pytest.mark.parametrize("is_drafting", [False, True])
+def test_draft_stream_salt_preserves_greedy_sampling(is_drafting):
+    logits = torch.tensor([0.0, 2.0, 1.0], device=DEVICE)
+    sampled = _sample(logits, 32, temperature=0.0, is_drafting=is_drafting)
+    assert (sampled == 1).all()

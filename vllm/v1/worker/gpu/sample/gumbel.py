@@ -13,6 +13,10 @@ from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
 # attribute is `None`, and `tl.constexpr(...)` would crash at import time.
 _TL_RAND_MIN = tl.constexpr(4.6566127342e-10) if HAS_TRITON else 4.6566127342e-10
 
+# Proposal and residual sampling must use independent Gumbel noise. Offsetting
+# draft positions separates their Philox stream from target sequence positions.
+_DRAFT_NOISE_SALT = tl.constexpr(1 << 30) if HAS_TRITON else (1 << 30)
+
 
 @triton.jit
 def _temperature_kernel(
@@ -95,6 +99,7 @@ def gumbel_block_argmax(
     processed_logits_stride,
     processed_logits_col_ptr,
     vocab_size,
+    IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr = False,
@@ -136,6 +141,8 @@ def gumbel_block_argmax(
         # Calculate the seed for gumbel noise.
         seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
         pos = tl.load(pos_ptr + token_idx)
+        if IS_DRAFTING:
+            pos = pos + _DRAFT_NOISE_SALT
         gumbel_seed = tl.randint(seed, pos)
 
         if USE_FP64:
@@ -175,6 +182,7 @@ def _gumbel_sample_kernel(
     temp_ptr,
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
+    IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
     PER_TOKEN_COL: tl.constexpr,
@@ -203,6 +211,7 @@ def _gumbel_sample_kernel(
         processed_logits_stride,
         processed_logits_col_ptr,
         vocab_size,
+        IS_DRAFTING=IS_DRAFTING,
         APPLY_TEMPERATURE=APPLY_TEMPERATURE,
         USE_FP64=USE_FP64,
         PER_TOKEN_COL=PER_TOKEN_COL,
@@ -219,6 +228,7 @@ def gumbel_sample(
     seed: torch.Tensor,  # [max_num_reqs]
     pos: torch.Tensor,  # [num_tokens]
     apply_temperature: bool,
+    is_drafting: bool,
     output_processed_logits: torch.Tensor | None = None,
     output_processed_logits_col: torch.Tensor | None = None,
     use_fp64: bool = False,
@@ -254,6 +264,7 @@ def gumbel_sample(
         temperature,
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        IS_DRAFTING=is_drafting,
         APPLY_TEMPERATURE=apply_temperature,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
