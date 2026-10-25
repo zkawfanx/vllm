@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from tests.v1.core.utils import create_requests
@@ -14,6 +15,7 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
+from vllm.platforms import current_platform
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -152,3 +154,96 @@ def test_dflash_drafter_window_reserves_bonus_token():
         speculative_config=SimpleNamespace(use_dflash=lambda: False),
     )
     assert input_fits_in_drafter(plain_runner, SimpleNamespace(max_seq_len=97))
+
+
+@pytest.mark.cpu_test
+def test_dflash_forward_exposes_padding_to_moe_router(monkeypatch):
+    from vllm.config import DeviceConfig
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        _get_padding_mask,
+    )
+    from vllm.v1.worker.gpu.input_batch import InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
+    buffers = InputBuffers(4, 16, device=torch.device("cpu"))
+    buffers.is_padding[2:] = True
+
+    def route(input_ids, positions, inputs_embeds):
+        return _get_padding_mask(input_ids.shape[0])
+
+    draft = SimpleNamespace(
+        input_buffers=buffers,
+        vllm_config=VllmConfig(device_config=DeviceConfig(device="cpu")),
+        model=route,
+    )
+    mask = DFlashSpeculator._run_model(draft, 8, None, None, None)
+    assert mask is not None
+    assert mask.tolist() == [False, False] + [True] * 6
+    buffers.is_padding[:4] = False
+    assert mask.tolist() == [False] * 4 + [True] * 4
+
+
+@pytest.mark.parametrize("sample_from_anchor", [False, True])
+def test_dflash_query_padding_resets_reused_buffers(sample_from_anchor):
+    if not current_platform.is_cuda_alike() or not torch.accelerator.is_available():
+        pytest.skip("requires CUDA or ROCm")
+    from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
+
+    device = torch.device("cuda")
+    max_reqs, max_tokens, num_spec = 4, 16, 3
+    num_query = num_spec if sample_from_anchor else num_spec + 1
+    target_buffers = InputBuffers(max_reqs, max_tokens, device=device)
+    buffers = InputBuffers(max_reqs, max_tokens, device=device)
+    buffers.is_padding.fill_(True)
+    query_slots = torch.full((max_tokens,), -2, dtype=torch.int64, device=device)
+    context_positions = torch.empty_like(query_slots)
+    context_slots = torch.empty_like(query_slots)
+    sample_indices = torch.empty(max_reqs * num_spec, dtype=torch.int64, device=device)
+    sample_pos = torch.empty_like(sample_indices)
+    sample_mapping = torch.empty_like(sample_indices)
+    temperature = torch.empty(max_reqs, device=device)
+    seeds = torch.empty(max_reqs, dtype=torch.int64, device=device)
+    last_sampled = torch.full_like(seeds, 99)
+    block_table = torch.arange(1, 17, dtype=torch.int32, device=device).view(4, 4)
+    for num_reqs in (1, 2, 1):
+        batch = InputBatch.make_dummy(num_reqs, num_reqs * 2, target_buffers)
+        batch.positions.copy_(torch.arange(num_reqs * 2, device=device))
+        prepare_dflash_inputs(
+            buffers,
+            query_slots,
+            context_positions,
+            context_slots,
+            sample_indices,
+            sample_pos,
+            sample_mapping,
+            temperature,
+            seeds,
+            batch,
+            torch.ones(num_reqs, dtype=torch.int32, device=device),
+            torch.zeros(num_reqs, dtype=torch.int32, device=device),
+            last_sampled,
+            torch.zeros_like(seeds),
+            torch.ones_like(temperature),
+            torch.ones_like(seeds),
+            block_table,
+            16,
+            123,
+            num_query,
+            num_spec,
+            max_reqs,
+            max_tokens,
+            64,
+            sample_from_anchor,
+        )
+        num_tokens = num_reqs * num_query
+        assert not buffers.is_padding[:num_tokens].any()
+        assert buffers.is_padding[num_tokens:].all()
+        assert (buffers.input_ids[num_tokens:] == 0).all()
+        assert (buffers.positions[num_tokens:] == 0).all()
+        assert (query_slots[num_tokens:] == PAD_SLOT_ID).all()
+        assert (query_slots[:num_tokens] > 0).all()
+        assert buffers.input_ids[:num_tokens:num_query].tolist() == [99] * num_reqs
+        assert (sample_mapping[num_reqs * num_spec :] == -1).all()
