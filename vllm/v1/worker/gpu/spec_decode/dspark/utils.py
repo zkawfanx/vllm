@@ -3,7 +3,7 @@
 
 import torch.nn as nn
 
-from vllm.config import ModelConfig, VllmConfig, replace
+from vllm.config import ModelConfig, ParallelConfig, VllmConfig, replace
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
@@ -36,6 +36,25 @@ def _resolve_dspark_attention_backend(
     return None
 
 
+def _get_dspark_parallel_config(
+    parallel_config: ParallelConfig,
+    tensor_parallel_size: int,
+) -> ParallelConfig:
+    if parallel_config.enable_eplb:
+        logger.warning_once(
+            "EPLB is disabled for the DSpark draft model. EPLB remains enabled "
+            "for the target model."
+        )
+    return replace(
+        parallel_config,
+        pipeline_parallel_size=1,
+        tensor_parallel_size=tensor_parallel_size,
+        enable_eplb=False,
+        eplb_config=replace(parallel_config.eplb_config, num_redundant_experts=0),
+        enable_elastic_ep=False,
+    )
+
+
 def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
@@ -53,6 +72,10 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
 
     draft_vllm_config = replace(
         vllm_config,
+        parallel_config=_get_dspark_parallel_config(
+            vllm_config.parallel_config,
+            speculative_config.draft_parallel_config.tensor_parallel_size,
+        ),
         attention_config=replace(
             vllm_config.attention_config,
             use_non_causal=dflash_has_any_non_causal(draft_model_config.hf_config),
