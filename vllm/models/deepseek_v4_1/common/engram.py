@@ -40,6 +40,7 @@ import numpy as np
 import torch
 from torch import nn
 
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -913,6 +914,7 @@ class Engram(nn.Module):
         layer_hash_index: int,
         use_sequence_parallel: bool,
         prefix: str,
+        prefetch_stream: torch.cuda.Stream | None = None,
     ) -> None:
         super().__init__()
         self.layer_hash_index = layer_hash_index
@@ -959,12 +961,46 @@ class Engram(nn.Module):
             dtype=torch.bfloat16,
         )
 
+        self._prefetch_stream: torch.cuda.Stream | None = None
+        self._prefetch_done: torch.cuda.Event | None = None
+        if self.embed_tokens.cpu_offload:
+            self._prefetch_stream = prefetch_stream
+            if self._prefetch_stream is None:
+                self._prefetch_stream = torch.cuda.Stream(
+                    device=self.staged_rows.device
+                )
+            self._prefetch_done = torch.cuda.Event()
+
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        """Gather this layer's rows on the main stream before decoder layers."""
-        self.embed_tokens.lookup(hash_ids, self.staged_rows[: hash_ids.shape[0]])
+        """Stage this layer's rows, asynchronously when the table is offloaded."""
+        rows = self.staged_rows[: hash_ids.shape[0]]
+        assert rows.shape[0] == hash_ids.shape[0], "engram staging buffer too small"
+        if self._prefetch_stream is None:
+            self.embed_tokens.lookup(hash_ids, rows)
+        else:
+            self._start_prefetch(hash_ids, rows, self._prefetch_stream)
+
+    @eager_break_during_capture
+    def _start_prefetch(
+        self, hash_ids: torch.Tensor, rows: torch.Tensor, stream: torch.cuda.Stream
+    ) -> None:
+        stream.wait_stream(torch.cuda.current_stream())
+        # Hashes can be temporary views; retain their storage until lookup completes.
+        hash_ids.record_stream(stream)
+        with torch.cuda.stream(stream):
+            self.embed_tokens.lookup(hash_ids, rows, background=True)
+            assert self._prefetch_done is not None
+            self._prefetch_done.record(stream)
+
+    @eager_break_during_capture
+    def _finish_prefetch(self, event: torch.cuda.Event) -> None:
+        # Later layers share the stream but must not delay this layer's consumer.
+        torch.cuda.current_stream().wait_event(event)
 
     def embed(self, hash_ids: torch.Tensor) -> torch.Tensor:
         """Gather heads, returning only local tokens when SP is enabled."""
+        if self._prefetch_done is not None:
+            self._finish_prefetch(self._prefetch_done)
         rows = self.staged_rows[: hash_ids.shape[0]]
         if self.embed_tokens.tp_size == 1:
             return rows

@@ -979,10 +979,6 @@ class VllmConfig:
 
     def _resolve_and_verify_engram_config(self) -> None:
         """Resolve legacy Engram offload settings and validate its scope."""
-        if self.engram_config is None:
-            if not envs.VLLM_PLE_CPU_OFFLOAD:
-                return
-            self.engram_config = EngramConfig()
         model_config = self.model_config
         speculative_config = self.speculative_config
         if (
@@ -990,6 +986,20 @@ class VllmConfig:
             and model_config is speculative_config.draft_model_config
         ):
             model_config = speculative_config.target_model_config
+        if (
+            model_config is not None
+            and model_config.architecture == "DeepseekV41ForCausalLM"
+            and getattr(model_config.hf_text_config, "engram_layer_ids", None)
+            and self.parallel_config.use_ubatching
+        ):
+            raise ValueError(
+                "DeepSeek V4.1 Engram does not support DBO or microbatching. "
+                "Disable --enable-dbo and set --ubatch-size to 0."
+            )
+        if self.engram_config is None:
+            if not envs.VLLM_PLE_CPU_OFFLOAD:
+                return
+            self.engram_config = EngramConfig()
         self.engram_config.verify_model_config(model_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
 

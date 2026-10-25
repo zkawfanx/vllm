@@ -183,6 +183,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
+        engram_prefetch_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
 
@@ -201,6 +202,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     engram_layout.layer_ids.index(layer_id),
                     use_sequence_parallel=self.use_sequence_parallel,
                     prefix=f"{prefix}.engram",
+                    prefetch_stream=engram_prefetch_stream,
                 )
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -467,6 +469,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         self.engram_layout = EngramLayout.from_config(config)
+        engram_config = vllm_config.engram_config
+        engram_prefetch_stream = (
+            torch.cuda.Stream()
+            if self.engram_layout is not None
+            and (engram_config is None or engram_config.cpu_offload)
+            else None
+        )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -477,6 +486,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
+                engram_prefetch_stream=engram_prefetch_stream,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -614,7 +624,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
-                # Gather all Engram rows before entering the decoder layers.
+                # Schedule all Engram lookups before entering the decoder layers.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
