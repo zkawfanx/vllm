@@ -317,6 +317,30 @@ def test_deepseek_v4_attention_quant_cache_roundtrip(num_tokens: int, block_size
 # ── Test B: Fused dequant+gather K cache ────────────────────────────────────
 
 
+@pytest.mark.parametrize(
+    ("bound", "expected"),
+    [
+        (None, 128),
+        (0, 128),
+        (1, 128),
+        (1023, 128),
+        (1024, 128),
+        (1025, 129),
+        (1032, 129),
+        (1033, 130),
+        (65528, 8191),
+        (65529, 8192),
+        (65536, 8192),
+        (65537, 8192),
+        (1 << 20, 8192),
+    ],
+)
+def test_v41_gather_num_workers(bound, expected):
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import gather_num_workers
+
+    assert gather_num_workers(bound) == expected
+
+
 def _dequantize_and_gather_k_cache_reference(
     out: torch.Tensor,
     k_cache: torch.Tensor,
@@ -445,6 +469,74 @@ def test_dequantize_and_gather_k_cache(
         actual = actual_out[req_id, offset : offset + gather_len]
         expected = ref_out[req_id, offset : offset + gather_len]
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA only")
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+@pytest.mark.parametrize("gather_mode", ["full", "short", "long"])
+@pytest.mark.parametrize("offset", [0, 7])
+def test_v41_fp8_gather_is_grid_width_invariant(compress_ratio, gather_mode, offset):
+    """Grid sizing preserves packed584 values and untouched output rows."""
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+        dequantize_and_gather_k_cache_triton,
+        quantize_and_insert_k_cache,
+    )
+
+    torch.manual_seed(7)
+    block_size, num_blocks = 256 // compress_ratio, 20
+    num_tokens = block_size * num_blocks
+    k = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    k[:, :448] *= torch.logspace(-2, 2, 7, device="cuda").repeat_interleave(64)
+    # Preserve the page padding as well as the 584-byte record contract.
+    page_stride = block_size * 584 + 576
+    backing = torch.zeros(num_blocks, page_stride, dtype=torch.uint8, device="cuda")
+    cache = backing.as_strided((num_blocks, block_size, 584), (page_stride, 584, 1))
+    slots = torch.arange(num_tokens, dtype=torch.int64, device="cuda")
+    quantize_and_insert_k_cache(k, cache.view(num_blocks, -1), slots, block_size)
+    block_table = torch.randperm(num_blocks, device="cuda").to(torch.int32).view(2, -1)
+    seq_lens = torch.tensor(
+        [9 * block_size + 7, 4 * block_size + 3], dtype=torch.int32, device="cpu"
+    )
+    gather_lens = {
+        "full": None,
+        "short": torch.tensor([70, 0], dtype=torch.int32, device="cpu"),
+        "long": seq_lens - 3,
+    }[gather_mode]
+    lengths = seq_lens if gather_lens is None else gather_lens
+    max_gather_len = int(lengths.max())
+    expected = torch.full(
+        (2, offset + max_gather_len + 3, 512), -99, dtype=torch.bfloat16, device="cpu"
+    )
+    _dequantize_and_gather_k_cache_reference(
+        expected,
+        cache.cpu(),
+        seq_lens,
+        gather_lens,
+        block_table.cpu(),
+        block_size,
+        offset,
+    )
+    seq_lens = seq_lens.cuda()
+    gather_lens = None if gather_lens is None else gather_lens.cuda()
+    baseline = None
+    for bound in (None, 8, max_gather_len, 1 << 20):
+        actual = torch.full_like(expected, -99, device="cuda")
+        dequantize_and_gather_k_cache_triton(
+            actual,
+            cache,
+            seq_lens,
+            gather_lens,
+            block_table,
+            block_size,
+            offset,
+            max_gather_len=bound,
+        )
+        actual = actual.cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if baseline is None:
+            baseline = actual
+        else:
+            torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
 
 
 # ── Test C: Indexer path ────────────────────────────────────────────────────
