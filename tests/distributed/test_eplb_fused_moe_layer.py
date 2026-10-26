@@ -21,6 +21,37 @@ from vllm.model_executor.layers.fused_moe import FusedMoEFactory, MoERunner
 from .eplb_utils import distributed_run, set_env_vars_and_device
 
 
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("dtype", [torch.float8_e8m0fnu, torch.bfloat16])
+@pytest.mark.parametrize("column_major", [False, True])
+def test_eplb_weight_views_preserve_scale_storage(dtype, column_major):
+    """EPLB transfers E8M0 bytes without changing the model's scale storage."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    layer = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(layer)
+    layer.local_num_experts = 2
+    scales = torch.arange(24, dtype=torch.uint8).reshape(2, 3, 4)
+    scales = scales.view(dtype) if dtype == torch.float8_e8m0fnu else scales.to(dtype)
+    if column_major:
+        scales = scales.transpose(1, 2)
+    layer.w13_weight_scale = torch.nn.Parameter(scales, requires_grad=False)
+    original_stride = scales.stride()
+
+    (transfer,) = layer.get_expert_weights()
+    transfer_dtype = torch.uint8 if dtype == torch.float8_e8m0fnu else dtype
+    assert transfer.dtype == transfer_dtype
+    assert transfer.shape == (2, 12)
+    assert transfer.data_ptr() == scales.data_ptr()
+    transfer.fill_(7)
+
+    assert layer.w13_weight_scale.dtype == dtype
+    assert layer.w13_weight_scale.stride() == original_stride
+    actual = scales.view(torch.uint8) if dtype == torch.float8_e8m0fnu else scales
+    torch.testing.assert_close(actual, torch.full_like(actual, 7))
+
+
 @dataclass
 class TestConfig:
     num_layers: int
