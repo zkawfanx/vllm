@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import math
 from unittest.mock import MagicMock
 
 import pytest
@@ -58,12 +57,22 @@ def test_processor_tokenizes_text_without_applying_image_updates():
 
 
 @pytest.mark.parametrize(
-    "max_wh_ratio,min_pixels",
-    [(None, 0), (2.0, 0), (1.25, 295936), (None, 295936)],
+    "budget,max_wh_ratio,min_pixels",
+    [
+        (64, None, 0),
+        (64, None, 295936),
+        (64, 1.0, 295936),
+        (64, 1.25, 295936),
+        (64, 1.4, 0),
+        (64, 1.4, 295936),
+        (64, 1.4, 1000000),
+        (64, 2.0, 0),
+        (64, 2.0, 295936),
+        (1024, None, 295936),
+    ],
 )
-def test_profile_image_covers_maximum_processed_features(max_wh_ratio, min_pixels):
-    """Profiling must cover every legal patch grid, including newline overhead."""
-    budget = 64
+def test_profile_image_covers_processed_features(budget, max_wh_ratio, min_pixels):
+    """Rank actual preprocessing, not a grid lost to clamping or downscaling."""
     config = DeepseekV41Config(
         vision_config={
             "max_image_tokens": budget,
@@ -75,22 +84,64 @@ def test_profile_image_covers_maximum_processed_features(max_wh_ratio, min_pixel
     ctx.get_hf_config.return_value = config
     info = DeepseekV4VLProcessingInfo(ctx)
     size = info.get_image_size_with_most_features()
-    processed = info.get_hf_processor()(
-        images=[Image.new("RGB", (size.width, size.height))]
-    )
+    processor = info.get_hf_processor()
+    processed = processor(images=[Image.new("RGB", (size.width, size.height))])
+    profile_patches = processed["patches"].shape[0]
 
-    downsample = config.vision_downsample_ratio
-    # Enumerate ViT grids directly, independently of the profiling search.
-    max_patches = max(
-        h * w
-        for h in range(1, downsample * (budget - 2) // 2 + 1)
-        for w in range(1, downsample * (budget - 3) + 1)
-        if math.ceil(h / downsample) * (math.ceil(w / downsample) + 1) + 2 <= budget
-        and (max_wh_ratio is None or w <= math.ceil(h * max_wh_ratio))
-    )
-    assert processed["patches"].shape[0] == max_patches
+    # Include the square and portrait that exceed the former 408-patch dummy
+    # at budget=64, max_wh_ratio=1.4, min_pixels=295936.
+    for dimensions in [(512, 512), (388, 776), (640, 480), (728, 504), (2814, 630)]:
+        reference = processor(images=[Image.new("RGB", dimensions)])
+        assert profile_patches >= reference["patches"].shape[0], dimensions
     assert processed["types"].numel() <= budget
-    assert size.height * size.width >= min_pixels
+    if budget == 1024:
+        assert profile_patches == 9189
+
+
+@pytest.mark.parametrize(
+    "vision_config,dimensions",
+    [
+        (
+            {
+                "max_image_tokens": 41,
+                "patch_size": 10,
+                "downsample_ratio": 4,
+                "max_wh_ratio": 3.9,
+                "min_pixels": 460000,
+            },
+            (1760, 480),
+        ),
+        ({"max_image_tokens": 5, "max_wh_ratio": 0.75}, (512, 1024)),
+        (
+            {
+                "max_image_tokens": 5,
+                "max_wh_ratio": 0.75,
+                "downsample_ratio": 1,
+            },
+            (512, 1024),
+        ),
+        (
+            {
+                "max_image_tokens": 4,
+                "downsample_ratio": 2,
+                "max_wh_ratio": 0.5,
+                "min_pixels": 0,
+            },
+            (1284, 2646),
+        ),
+    ],
+)
+def test_profile_image_covers_downscaled_grids(vision_config, dimensions):
+    """Downscaling can favor full aligner cells over the rounded clamp edge."""
+    ctx = MagicMock()
+    ctx.get_hf_config.return_value = DeepseekV41Config(vision_config=vision_config)
+    info = DeepseekV4VLProcessingInfo(ctx)
+    size = info.get_image_size_with_most_features()
+    processor = info.get_hf_processor()
+    profile = processor(images=[Image.new("RGB", (size.width, size.height))])
+    reference = processor(images=[Image.new("RGB", dimensions)])
+    assert profile["patches"].shape[0] >= reference["patches"].shape[0]
+    assert profile["types"].numel() <= vision_config["max_image_tokens"]
 
 
 def test_profile_image_rejects_budget_without_room_for_patches():

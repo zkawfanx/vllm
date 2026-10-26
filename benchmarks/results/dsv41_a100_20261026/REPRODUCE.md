@@ -76,8 +76,10 @@ export OMP_NUM_THREADS=4
   --speculative-config '{"method":"dspark","num_speculative_tokens":5}'
 ```
 
-The effective server cache block size is **8**, despite the CLI's 256. The
-model results contain the resolved cache/compilation configuration; CLI
+The frontend reports cache block size **8**, the minimum across heterogeneous
+cache groups, despite the explicit CLI block size 256. This does not change
+the physical SM80 KV584 layout or make every cache group use eight-token pages.
+The model results contain the resolved cache/compilation configuration; CLI
 arguments alone do not establish the actual graph execution path.
 
 - Eager comparison: add `--enforce-eager` on the recorded eager revision.

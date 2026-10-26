@@ -14,16 +14,21 @@ items; this report is not a recommendation to merge or deploy.
 
 - Target: `zkawfanx/vllm`, branch `codex/dsv41-flash-a100`.
 - Baseline: `78da347b7dbcf3ba52d96cadd7fe3b16d65cde9f`.
-- Final validated source: `d6c94fa2e8b9d5f5233b559c69feeab28c94b886`.
+- Final source in this historical validation: `d6c94fa2e8b9d5f5233b559c69feeab28c94b886`.
 - [Ordered source commits and donor references](commits.json): 27 commits.
 - [Roadmap issue](https://github.com/zkawfanx/vllm/issues/18) remains open;
   this bundle covers selected items, not the entire roadmap.
 
-The evidence commit adds only this report and data. Each result identifies
+The original evidence commit adds only this report and data. Each result identifies
 the source used for that run; earlier results are not relabelled as a complete
 rerun at the final source revision. There are no native C++/CUDA, schema or
 build-system changes in the source series. The existing SM80 KV584 ABI and
 seven loaded native libraries were preserved and verified per successful run.
+
+The subsequent review correction to image-profile geometry is not covered by
+these historical model runs. It fixes custom aspect-ratio/min-pixel combinations
+and has a separate focused validation handoff; the recorded outcomes below
+remain attached to their original source revisions.
 
 Review the source commits in these groups:
 
@@ -56,7 +61,11 @@ This is a fork integration draft, not a competing upstream proposal. Related
 upstream work is explicitly recorded, including merged
 [#59307](https://github.com/vllm-project/vllm/pull/59307) for non-Harmony
 streamed-item reuse, open Responses proposals #54064/#56285/#58018, routing
-fallback #63687, and EPLB alias deduplication #63075. The local corrections
+fallback #63687, and EPLB alias deduplication #63075. Merged
+[#61786](https://github.com/vllm-project/vllm/pull/61786) is the direct upstream
+analogue for byte-view EPLB transfers; this fork uses a narrower E8M0-only view
+at `RoutedExperts.get_expert_weights`. It is distinct from alias deduplication.
+The local corrections
 must not be presented as novel upstream fixes. Broad searches capped at 100
 results are discovery only; the record also contains narrower searches and
 inspection of the related proposals.

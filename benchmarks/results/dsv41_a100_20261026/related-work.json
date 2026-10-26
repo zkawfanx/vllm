@@ -54,6 +54,7 @@
     }
   ],
   "related": [
+    {"number": 61786, "url": "https://github.com/vllm-project/vllm/pull/61786", "title": "[Bugfix][EPLB] Move 1-byte expert tensors as uint8 views", "merge_commit": "876d5da8316a81180b8c7f10dea5ffab5b5a849f", "disposition": "Merged upstream byte-view EPLB transfer analogue. The fork's correction exposes E8M0-only byte views from RoutedExperts.get_expert_weights; this is narrower than the upstream one-byte tensor treatment and separate from alias-region deduplication #63075. Added during follow-up review; not part of the original search transcript."},
     {"number": 51346, "url": "https://github.com/vllm-project/vllm/pull/51346", "disposition": "Open XPU sequence-parallel enablement; this change fixes the fork's A100 token-ID sharding and MoE dispatch."},
     {"number": 54064, "url": "https://github.com/vllm-project/vllm/pull/54064", "title": "[Responses] Implement usage tracking, streaming final items, incomplete_reason, and MCP/builtin tool rendering", "disposition": "Open broader Responses proposal overlaps streamed final-item accumulation; no competing upstream PR is proposed."},
     {"number": 56285, "url": "https://github.com/vllm-project/vllm/pull/56285", "title": "[Bugfix][Frontend] Improve Responses API compatibility for Codex clients", "disposition": "Open broader Responses compatibility proposal overlaps IDs/logprobs and includes unrelated custom-tool and reasoning features."},
