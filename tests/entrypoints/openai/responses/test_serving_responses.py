@@ -13,6 +13,7 @@ from openai.types.responses import (
     ResponseReasoningTextDoneEvent,
     ResponseTextConfig,
     ResponseTextDeltaEvent,
+    response_text_delta_event,
 )
 from openai.types.responses.response_format_text_json_schema_config import (
     ResponseFormatTextJSONSchemaConfig,
@@ -764,6 +765,96 @@ def _mock_parser_with_reasoning(serving, delta_sequence: list[DeltaMessage]):
     mock_parser_instance.is_reasoning_end = MagicMock(return_value=False)
     serving.parser = MagicMock(return_value=mock_parser_instance)
     return mock_parser_instance
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("include_reasoning", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+async def test_completed_response_preserves_streamed_items(
+    monkeypatch, include_reasoning, empty
+):
+    """Completed and stored responses must retain streamed item and call IDs."""
+    monkeypatch.setattr(envs, "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT", False)
+    serving = _make_serving_instance_with_reasoning()
+    deltas = (
+        []
+        if empty
+        else [
+            DeltaMessage(reasoning="thinking"),
+            DeltaMessage(content="answer"),
+            *[
+                DeltaMessage(
+                    tool_calls=[
+                        DeltaToolCall(
+                            index=i,
+                            function=DeltaFunctionCall(
+                                name="get_weather", arguments="{}"
+                            ),
+                        )
+                    ]
+                )
+                for i in range(2)
+            ],
+        ]
+    )
+    parser = _mock_parser_with_reasoning(serving, deltas)
+    serving._create_stream_response_logprobs = MagicMock(
+        return_value=[
+            response_text_delta_event.Logprob(token="answer", logprob=-0.1, bytes=[])
+        ]
+    )
+    parser.reasoning_parser.count_reasoning_tokens.return_value = 0
+    parser.parse.return_value = ("thinking" if not empty else None, "answer", [])
+    context = SimpleContext(response_parser=parser)
+
+    async def generate():
+        for _ in deltas or [None]:
+            chunk = _make_simple_context_with_output("chunk", [10])
+            context.append_output(chunk.last_output)
+            yield context
+
+    request = ResponsesRequest(
+        input="hi",
+        stream=True,
+        store=True,
+        include_reasoning=include_reasoning,
+        include=["message.output_text.logprobs"],
+    )
+    events = [
+        event
+        async for event in serving.responses_stream_generator(
+            request,
+            SamplingParams(max_tokens=64),
+            generate(),
+            context,
+            "test-model",
+            MagicMock(),
+            RequestResponseMetadata(request_id="req"),
+        )
+    ]
+    added = [e.item for e in events if e.type == "response.output_item.added"]
+    done = [e.item for e in events if e.type == "response.output_item.done"]
+    response = events[-1].response
+    expected_types = (
+        []
+        if empty
+        else (
+            (["reasoning"] if include_reasoning else [])
+            + ["message", "function_call", "function_call"]
+        )
+    )
+    assert [item.type for item in done] == expected_types
+    assert [item.id for item in added] == [item.id for item in done]
+    assert response.output == done
+    assert serving.response_store[response.id].output == done
+    for item in response.output:
+        if item.type == "message":
+            logprobs = item.content[0].logprobs
+            assert ([lp.logprob for lp in logprobs] if logprobs else []) == (
+                [-0.1] if include_reasoning else []
+            )
+    parser.parse.assert_not_called()
 
 
 class TestStreamingReasoningToContentTransition:

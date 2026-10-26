@@ -8,12 +8,13 @@ from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Se
 from contextlib import AsyncExitStack
 from copy import copy
 from http import HTTPStatus
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from fastapi import Request
 from openai.types.responses import (
     ResponseFunctionToolCall,
     ResponseOutputItem,
+    ResponseOutputItemDoneEvent,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseStatus,
@@ -789,6 +790,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         created_time: int | None = None,
+        streamed_output: list[ResponseOutputItem] | None = None,
     ) -> ErrorResponse | ResponsesResponse:
         if created_time is None:
             created_time = int(time.time())
@@ -871,6 +873,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 final_output,
                 tokenizer,
                 parser=context.response_parser,
+                streamed_output=streamed_output,
             )
 
             if request.enable_response_messages:
@@ -1045,6 +1048,7 @@ class OpenAIServingResponses(GenerateBaseServing):
         final_output: CompletionOutput,
         tokenizer: TokenizerLike,
         parser: Parser | None = None,
+        streamed_output: list[ResponseOutputItem] | None = None,
     ) -> list[ResponseOutputItem]:
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
@@ -1056,6 +1060,9 @@ class OpenAIServingResponses(GenerateBaseServing):
                 is_streaming=False,
                 delta=False,
             )
+
+        if streamed_output is not None:
+            return streamed_output
 
         # Compute logprobs if requested
         logprobs = None
@@ -1392,6 +1399,9 @@ class OpenAIServingResponses(GenerateBaseServing):
             if not delta_message:
                 continue
 
+            if not request.include_reasoning:
+                delta_message.reasoning = None
+
             for dm in split_delta(delta_message):
                 target_state, tool_call = processor.resolve_target_state(dm)
                 if target_state == _StateType.NONE:
@@ -1514,6 +1524,9 @@ class OpenAIServingResponses(GenerateBaseServing):
             )
 
             try:
+                streamed_output: list[ResponseOutputItem] | None = (
+                    [] if isinstance(context, SimpleContext) else None
+                )
                 async for event_data in processor(
                     request,
                     sampling_params,
@@ -1525,11 +1538,17 @@ class OpenAIServingResponses(GenerateBaseServing):
                     created_time,
                     _increment_sequence_number_and_return,
                 ):
+                    if streamed_output is not None and isinstance(
+                        event_data, ResponseOutputItemDoneEvent
+                    ):
+                        streamed_output.append(event_data.item)
                     yield event_data
             except GenerationError as e:
                 error_json = self._convert_generation_error_to_streaming_response(e)
                 yield _increment_sequence_number_and_return(
-                    TypeAdapter(StreamingResponsesResponse).validate_json(error_json)
+                    TypeAdapter[StreamingResponsesResponse](
+                        cast(Any, StreamingResponsesResponse)
+                    ).validate_json(error_json)
                 )
                 return
 
@@ -1548,6 +1567,7 @@ class OpenAIServingResponses(GenerateBaseServing):
                 tokenizer,
                 request_metadata,
                 created_time=created_time,
+                streamed_output=streamed_output,
             )
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
