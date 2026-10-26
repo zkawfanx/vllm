@@ -35,11 +35,12 @@ def sp_reduce_scatter(x: torch.Tensor) -> torch.Tensor:
 
 
 def sp_shard(x: torch.Tensor) -> torch.Tensor:
-    assert x.ndim == 2
+    assert x.ndim in (1, 2)
     tp_size = get_tensor_model_parallel_world_size()
     padding = (-x.shape[0]) % tp_size
     if padding:
-        x = torch.nn.functional.pad(x, (0, 0, 0, padding))
+        pad = (0, padding) if x.ndim == 1 else (0, 0, 0, padding)
+        x = torch.nn.functional.pad(x, pad)
     chunk = x.shape[0] // tp_size
     rank = get_tensor_model_parallel_rank()
     return x[rank * chunk : (rank + 1) * chunk]

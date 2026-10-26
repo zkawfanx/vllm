@@ -9,6 +9,32 @@ import torch
 
 @pytest.mark.cpu_test
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("num_tokens", [0, 1, 5, 8])
+def test_sequence_parallel_token_ids_stay_aligned_with_hidden_rows(
+    monkeypatch, num_tokens
+):
+    """Target and draft token-ID vectors must shard like hidden-state matrices."""
+    from vllm.models.common.ops import sequence_parallel as sp
+
+    monkeypatch.setattr(sp, "get_tensor_model_parallel_world_size", lambda: 4)
+    token_ids = torch.arange(num_tokens, dtype=torch.int64) + 101
+    hidden_states = torch.stack((token_ids, token_ids + 100), dim=-1)
+    shards = []
+    for rank in range(4):
+        monkeypatch.setattr(
+            sp, "get_tensor_model_parallel_rank", lambda rank=rank: rank
+        )
+        ids = sp.sp_shard(token_ids)
+        assert ids.shape == ((num_tokens + 3) // 4,)
+        torch.testing.assert_close(ids, sp.sp_shard(hidden_states)[:, 0])
+        shards.append(ids)
+    joined = torch.cat(shards)
+    torch.testing.assert_close(joined[:num_tokens], token_ids)
+    assert not joined[num_tokens:].any()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
 def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
     """Pipeline entry must apply Engram before computing attention mixing."""
     model_module = import_module("vllm.models.deepseek_v4_1.nvidia.model")
