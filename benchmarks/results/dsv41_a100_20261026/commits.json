@@ -1,0 +1,141 @@
+{
+  "base": "78da347b7dbcf3ba52d96cadd7fe3b16d65cde9f",
+  "validated_source_head": "d6c94fa2e8b9d5f5233b559c69feeab28c94b886",
+  "commits": [
+    {
+      "sha": "31538080188883d82843090d84e1f7cc3212bac1",
+      "subject": "[Bugfix] Update Python DeepSeek V4.1 reasoning effort mappings",
+      "upstream_pr_references": [58316]
+    },
+    {
+      "sha": "bf327e63125c7077187b53956f6c34820a3e1ac4",
+      "subject": "[Bugfix] Align DeepSeek V4.1 images with rendered content",
+      "upstream_pr_references": [60792]
+    },
+    {
+      "sha": "bc8d263d618fcbcf0d02c62e0dbbff527a10e16c",
+      "subject": "[Bugfix] Match DeepSeek V4.1 prompts to the 1017 reference",
+      "upstream_pr_references": [62199]
+    },
+    {
+      "sha": "bf47576840a968fe837656d0cb3118c8dfb4589b",
+      "subject": "[Test] Preserve DeepSeek V4 renderer prompt outputs",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "90049d2967e23051c1b7af982884d717fe8f4540",
+      "subject": "[DeepSeek] Backport bounded V4.1 tool grammar correctness",
+      "upstream_pr_references": [50502, 56408, 59879]
+    },
+    {
+      "sha": "5374ba2906670633da89469abb9efdd0ec019a9b",
+      "subject": "Fix MRV2 request mapping row-offset overflow",
+      "upstream_pr_references": [60736]
+    },
+    {
+      "sha": "6b2b6afef73f6c4bd55aff39fd21be19009db767",
+      "subject": "[Parser] Preserve DSML parameters without a string attribute",
+      "upstream_pr_references": [54838, 56271]
+    },
+    {
+      "sha": "31f556ef91f0c01c5ad6af4bcbd77b16754caee1",
+      "subject": "Keep DeepSeek V4.1 image prefill causal",
+      "upstream_pr_references": [57152]
+    },
+    {
+      "sha": "4425846c800bbe14bb68bbb598f7e2282d89b4ba",
+      "subject": "[Bugfix] Inject DeepSeek V4.1 Engram at pipeline stage entry",
+      "upstream_pr_references": [62208]
+    },
+    {
+      "sha": "9dfa47c012d130104b4c6812ed64950b6c127e27",
+      "subject": "[Perf] Collapse DeepSeek V4.1 draft states before SP gather",
+      "upstream_pr_references": [56903]
+    },
+    {
+      "sha": "c875d960c117579aa54d8c19697842ac522bd63a",
+      "subject": "[Bugfix] Isolate DSpark draft EPLB configuration",
+      "upstream_pr_references": [56387]
+    },
+    {
+      "sha": "86874baa274ae15b502ff17906355e24537b77bd",
+      "subject": "[Bugfix] Reject unproposed draft tokens through all verification paths",
+      "upstream_pr_references": [50939, 58784]
+    },
+    {
+      "sha": "04be2573ffa3f61d7be23dfabdd262bbdcacf4a8",
+      "subject": "[Bugfix] Separate draft and target Gumbel sampling streams",
+      "upstream_pr_references": [54282]
+    },
+    {
+      "sha": "8564d20fc93c2c95ff23a93ddd132076c25c60cc",
+      "subject": "[Bugfix] Carry draft graph padding through DeepSeek MoE routing",
+      "upstream_pr_references": [59166]
+    },
+    {
+      "sha": "cfff51c9197da0159c1202dab8d28cbefb1c6d9e",
+      "subject": "[Model Loader] Initialize dummy weights according to dtype",
+      "upstream_pr_references": [56688, 61134]
+    },
+    {
+      "sha": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "subject": "[Bugfix] Separate speculative draws at revisited positions by step",
+      "upstream_pr_references": [50939, 54282, 56387, 58784, 61161]
+    },
+    {
+      "sha": "61f12cfefaaad963eadbe78bec71e3b426d905b0",
+      "subject": "[Perf] Prefetch offloaded Engram rows on a shared model stream",
+      "upstream_pr_references": [56512, 56926]
+    },
+    {
+      "sha": "d3d2abc376d073e2ae15ec058569ba65315575f2",
+      "subject": "[Perf][DSpark] Capture draft context preparation in full graphs",
+      "upstream_pr_references": [57632, 59511]
+    },
+    {
+      "sha": "4e6385b182f0d41107123b8ed89be2a97d90d1d5",
+      "subject": "[Fix] Preserve V4.1 image bias in fallback MoE routing",
+      "upstream_pr_references": [54566, 56599]
+    },
+    {
+      "sha": "fa5c82d283a8e19c6b28ce37b26585f83fe3d2d8",
+      "subject": "[Fix] Keep vision routing scores stable across fallback layouts",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "5bc3b4d749ca68992a40bfdc56f7442554476390",
+      "subject": "[Bugfix] Profile maximum DeepSeek V4.1 vision features",
+      "upstream_pr_references": [57898]
+    },
+    {
+      "sha": "2c9e9a3b51642d30d2a054b4a6911d921683e755",
+      "subject": "[Test] Distinguish standard and block proposal acceptance",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "0cea8a447403e8ca0e5e84e4cbf43020873f6382",
+      "subject": "[Fix] Preserve vision routing scores near softplus cancellation",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "92b7822093adfbb784f82679c15322eac9dbe0cf",
+      "subject": "Preserve Responses streaming items through completion",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "6dfc982c6e033f6fabcfcc658fe9c4128191d1f6",
+      "subject": "Fix sequence-parallel sharding of token ID vectors",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "935c68509f3b76269d76a364a77c34e5d9cf25ca",
+      "subject": "Align DeepSeek fused MoE dispatch with sequence-parallel tokens",
+      "upstream_pr_references": []
+    },
+    {
+      "sha": "d6c94fa2e8b9d5f5233b559c69feeab28c94b886",
+      "subject": "Transfer E8M0 expert scales through byte views in EPLB",
+      "upstream_pr_references": []
+    }
+  ]
+}

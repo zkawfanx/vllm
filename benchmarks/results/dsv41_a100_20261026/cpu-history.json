@@ -1,0 +1,289 @@
+{
+  "date": "2026-10-25",
+  "reported_cumulative_distinct_passes": 615,
+  "scope": "Historical incremental CPU coverage; repeated runs below must not be summed. Not a rerun at final HEAD and overlaps the Oct26 suites.",
+  "final_source_commit": "5bc3b4d749ca68992a40bfdc56f7442554476390",
+  "raw_summary_sha256": "c1a83309d7fa431c79cc21d90380f5948ae7d0d5b1f0bc619c3f579bf50916ba",
+  "successful_runs": [
+    {
+      "label": "causal-config",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": [
+        "--confcutdir=tests/config",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/config/test_model_arch_config.py",
+        "-k",
+        "deepseek_v41_images or head_size_falls_back or legacy_modelopt",
+        "-q"
+      ],
+      "reported_counts": {"passed": 4},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "dd6e3178ee69fc3acf6828b4c05f643e781a090cdb23f5707038bf86b774ac7d",
+      "raw_log_sha256": "05c8893a5b1c39e82695a07fd5e3eef4884249a9f1491b1dd84e5f16817f96bc"
+    },
+    {
+      "label": "context-composition",
+      "source_commit": "d3d2abc376d073e2ae15ec058569ba65315575f2",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/v1/spec_decode/test_dflash_lookahead.py::test_dflash_context_staging_uses_target_aux_width",
+        "tests/v1/spec_decode/test_dflash_lookahead.py::test_dflash_context_capture_preserves_cache_rows",
+        "tests/v1/spec_decode/test_dflash_lookahead.py::test_dflash_capture_inserts_context_before_query",
+        "tests/v1/spec_decode/test_dflash_lookahead.py::test_dflash_forward_exposes_padding_to_moe_router",
+        "tests/v1/worker/test_dspark_utils.py",
+        "tests/v1/worker/test_gpu_autoregressive_speculator.py",
+        "tests/test_config.py::test_engram_rejects_overlapping_microbatches_before_offload_defaults",
+        "tests/kernels/test_engram.py::test_engram_consumer_completes_only_its_layer_on_shared_stream",
+        "tests/kernels/moe/test_topk_softplus_sqrt.py",
+        "-k",
+        "not sampling_keys_advance and (context or capture_inserts or forward_exposes or test_run_model or test_prefill_sampling or test_decode_sampling or engram or eplb or padding_route_eligibility or routing_method)",
+        "-q"
+      ],
+      "reported_counts": {"passed": 25},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "3c92754a256db4fda5b33475708285441308a604c6e5a91f3b9d898359920806",
+      "raw_log_sha256": "f8e4897f05a11c32cd65c1a3d7e9b34af0a65b957536b88fe0e2172fb89e316c"
+    },
+    {
+      "label": "context-dspark-config",
+      "source_commit": "d3d2abc376d073e2ae15ec058569ba65315575f2",
+      "pytest_argv": ["--confcutdir=tests", "-o", "addopts=", "-o", "usefixtures=", "tests/v1/worker/test_dspark_utils.py", "-q"],
+      "reported_counts": {"passed": 2},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "8f4f9cc6414645549b441327dab1d89a366f05b5f0f8fec442bcde64402485a1",
+      "raw_log_sha256": "c364e7d5e263e6fce765cd38eb361a06cdd640ddbcb63aadcb4660ae1f9e389f"
+    },
+    {
+      "label": "dummy",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": [
+        "--confcutdir=tests/model_executor",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/model_executor/test_weight_utils.py",
+        "tests/model_executor/model_loader/test_reload.py",
+        "-k",
+        "dummy",
+        "-q"
+      ],
+      "reported_counts": {"passed": 20, "skipped": 5},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "62e14677cf2242819f5e505d7abce79c07bb3af509f1fb2dc74bc6f4acac8cdd",
+      "raw_log_sha256": "f589b96e2e915a628134335c6ceff6e3f215dfc83b01b02a8b9ff00d194ebd40"
+    },
+    {
+      "label": "engram-composition",
+      "source_commit": "61f12cfefaaad963eadbe78bec71e3b426d905b0",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/test_config.py",
+        "tests/kernels/test_engram.py",
+        "tests/models/test_deepseek_v41_pipeline.py",
+        "tests/model_executor/test_weight_utils.py",
+        "tests/model_executor/model_loader/test_reload.py",
+        "-k",
+        "engram_rejects_overlapping or engram_prefetch or engram_prepared or engram_consumer or engram_head_collectives or stage_entry_injects_engram or dummy",
+        "-q"
+      ],
+      "reported_counts": {"passed": 26, "skipped": 21},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "cc037c89cb51f534e67d08e05ac0b99b6d9856986792e067b58b5791d58a5745",
+      "raw_log_sha256": "df4c5564937f66b76be624908968a7f6fc93ebc6854d2757f6078e46fe893b5d"
+    },
+    {
+      "label": "frontend-parser",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": [
+        "tests/tokenizers_/test_deepseek_v4.py",
+        "tests/tokenizers_/test_deepseek_v41.py",
+        "tests/parser/engine/test_deepseek_v4.py",
+        "tests/parser/engine/test_deepseek_v41.py",
+        "tests/parser/engine/test_deepseek_v32.py",
+        "tests/v1/worker/test_gpu_input_batch_v2.py",
+        "-m",
+        "not gpu",
+        "-k",
+        "not gpu_input_batch or dummy_request_indices",
+        "-q"
+      ],
+      "reported_counts": {"passed": 247},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "e49159bd0e77b438718eebf7b5172de8e6160d12275b3a0906b723d75bef035f",
+      "raw_log_sha256": "5129910ded1a71383d4fc8d7548f549bc689aa26b1d62d78e90b0d5dc75afb84"
+    },
+    {
+      "label": "grammar",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": ["tests/tool_parsers/test_structural_tag_registry.py", "tests/tool_use/test_tool_choice_required.py", "tests/tool_parsers/test_functiongemma_tool_parser.py", "-q"],
+      "reported_counts": {"passed": 294},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "a6db8c910a4bc7a9a33c67c9b7b869c130b4d9517bfaf029a36a3343d3fe38b1",
+      "raw_log_sha256": "13af7a033745c63ae4e26c366e19487f423b8fea734da7bdf9447dd623227ed6"
+    },
+    {
+      "label": "model-causal-final",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/models/test_deepseek_v41_pipeline.py::test_stage_entry_injects_engram_before_mhc_pre",
+        "tests/kernels/attention/test_flashmla_sparse.py::test_deepseek_v4_prefill_chunk_planning_expands_for_short_sequences",
+        "tests/kernels/attention/test_flashmla_sparse.py::test_flashinfer_sparse_indices_cache",
+        "tests/kernels/attention/test_flashmla_sparse.py::test_v41_image_swa_metadata_and_warmup_match_text",
+        "-q"
+      ],
+      "reported_counts": {"passed": 4},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "313c14fcefc1c476583bb7ac6bc86b4c84bfdd862be0a07e64d91509f4997e99",
+      "raw_log_sha256": "5b773b6be48e601db161053e7ceddf5c379c42f550cfde97243b2fc747372baa"
+    },
+    {
+      "label": "model-causal-retry",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/models/test_deepseek_v41_pipeline.py::test_stage_entry_injects_engram_before_mhc_pre",
+        "tests/kernels/attention/test_flashmla_sparse.py::test_deepseek_v4_prefill_chunk_planning_expands_for_short_sequences",
+        "tests/kernels/attention/test_flashmla_sparse.py::test_flashinfer_sparse_indices_cache",
+        "tests/kernels/attention/test_flashmla_sparse.py::test_v41_image_swa_metadata_and_warmup_match_text",
+        "-q"
+      ],
+      "reported_counts": {"passed": 4},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "1da182eda574e799f5f52a8501606eea356981aa48a4a11ddb65f36bc305d072",
+      "raw_log_sha256": "732ff5c06b94be3bed77abb1c051fa8c038c7ae7eb7f0eeb294597b3ca991ba2"
+    },
+    {
+      "label": "padding-context",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": ["--confcutdir=tests/v1/spec_decode", "-o", "addopts=", "-o", "usefixtures=", "tests/v1/spec_decode/test_dflash_lookahead.py", "-k", "forward_exposes_padding", "-q"],
+      "reported_counts": {"passed": 1},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "adde697ad695390f41d830a15ec215568f4d601ec7fe12267b449a962d5226f2",
+      "raw_log_sha256": "4d301741a1d22a53b594584002f230431fa1926216c81874f1251950d476d7fb"
+    },
+    {
+      "label": "padding-router",
+      "source_commit": "fa685c0272f9212f48db7ab5aacb11d0e66a504b",
+      "pytest_argv": [
+        "--confcutdir=tests/kernels/moe",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/kernels/moe/test_topk_softplus_sqrt.py",
+        "-k",
+        "padding_route_eligibility or routing_method",
+        "-q"
+      ],
+      "reported_counts": {"passed": 4},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "c7518fc7731cc3e16c4afd0e125249bab0ba70e4812fc0b9732818d54b0e79d0",
+      "raw_log_sha256": "ac615180980f4971b9887319cf7a0980df86d414171d3c0751c47b916a1180f7"
+    },
+    {
+      "label": "vision-composition-final",
+      "source_commit": "4e6385b182f0d41107123b8ed89be2a97d90d1d5",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/models/test_deepseek_v4_mega_moe.py",
+        "tests/kernels/moe/test_topk_softplus_sqrt.py",
+        "-k",
+        "fused_moe_routes_image_sentinels_without_hash_table or v41_vision_routing or padding_route_eligibility or routing_method",
+        "-q"
+      ],
+      "reported_counts": {"passed": 16, "skipped": 10},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "b3a33db38e53ffc8ebd575405f7151195ddb13addc5ee6f9d97cda02c1f8084f",
+      "raw_log_sha256": "91c627f4357496e95a752b3be113de17d211d112f845ef9913c8a8bf589587b9"
+    },
+    {
+      "label": "vision-composition",
+      "source_commit": "4e6385b182f0d41107123b8ed89be2a97d90d1d5",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/models/test_deepseek_v4_mega_moe.py",
+        "tests/kernels/moe/test_topk_softplus_sqrt.py",
+        "-k",
+        "fused_moe_routes_image_sentinels_without_hash_table or v41_vision_routing or padding_route_eligibility or routing_method",
+        "-q"
+      ],
+      "reported_counts": {"passed": 12, "skipped": 14},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "475dfe2a65ec26fa7417195976196d7270fb9f6bd28f23aec40781192260ae35",
+      "raw_log_sha256": "360f844dc1f7e2059e3893d9cf30c3f83786c8b44e6ced37fd1395d3ac45e49b"
+    },
+    {
+      "label": "vision-final",
+      "source_commit": "fa5c82d283a8e19c6b28ce37b26585f83fe3d2d8",
+      "pytest_argv": [
+        "--confcutdir=tests",
+        "-o",
+        "addopts=",
+        "-o",
+        "usefixtures=",
+        "tests/models/test_deepseek_v4_mega_moe.py",
+        "tests/kernels/moe/test_topk_softplus_sqrt.py",
+        "-k",
+        "fused_moe_routes_image_sentinels_without_hash_table or v41_vision_routing or padding_route_eligibility or routing_method",
+        "-q"
+      ],
+      "reported_counts": {"passed": 16, "skipped": 10},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "01d9867d7e6f4c55e49b639944aab6a0c4572247c700acb5cac6c27bf5e1393a",
+      "raw_log_sha256": "ccfe8a756d05f778273fc732d6c71d4987a85abca7d3572d4d1910280f6d6196"
+    },
+    {
+      "label": "vision-profile-final",
+      "source_commit": "5bc3b4d749ca68992a40bfdc56f7442554476390",
+      "pytest_argv": ["--confcutdir=tests", "-o", "addopts=", "-o", "usefixtures=", "tests/models/multimodal/processing/test_deepseek_v41.py", "-q"],
+      "reported_counts": {"passed": 6},
+      "source_start_equals_end": true,
+      "foreign_python_modules": 0,
+      "raw_provenance_sha256": "ff206cf15c42ce4b434ea416ef0e76e94f1fd681413948edba77f402c893b2af",
+      "raw_log_sha256": "ddbbc5b98d2d263dfd9182258717290e009ef31efb0fe118bbd0bb5af19be8ef"
+    }
+  ]
+}

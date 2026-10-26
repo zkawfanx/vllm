@@ -1,0 +1,136 @@
+{
+  "initial_cpu_validated_head": "5bc3b4d749ca68992a40bfdc56f7442554476390",
+  "candidate_head": "d6c94fa2e8b9d5f5233b559c69feeab28c94b886",
+  "baseline_head": "78da347b7dbcf3ba52d96cadd7fe3b16d65cde9f",
+  "fixes": [
+    {
+      "commit": "2c9e9a3b51642d30d2a054b4a6911d921683e755",
+      "scope": "test only",
+      "reason": "standard rejection and joint block verification have different valid-proposal acceptance controls",
+      "result": "51 rejection cases pass"
+    },
+    {
+      "commit": "0cea8a447403e8ca0e5e84e4cbf43020873f6382",
+      "scope": "vision-only Triton softplus scoring and regression",
+      "reason": "log(1+exp(logit)) cancels to zero near -20..-17; use log1p",
+      "negative_control": "4 A100 failures,12 passes before fix",
+      "result": "170 routing cases pass; hook formatting AST-equal to tested source; hooks and manual mypy3.12 pass"
+    },
+    {
+      "commit": "92b7822093adfbb784f82679c15322eac9dbe0cf",
+      "scope": "Responses streaming completion and metadata",
+      "reason": "Final response reparsed output, replacing message, reasoning and tool-call IDs already emitted in the stream",
+      "negative_control": "7 of 28 live API cases failed at 0cea8a4474; saved streamed/final IDs differ",
+      "result": "65 focused CPU tests pass, 1 existing expected failure; all 28 live API cases pass; commit hooks and manual mypy3.12 pass"
+    },
+    {
+      "commit": "6dfc982c6e033f6fabcfcc658fe9c4128191d1f6",
+      "scope": "Shared sequence-parallel token-ID sharding",
+      "reason": "The real TP4/DP2 target model passed 1D input IDs into a helper accepting only 2D hidden states; profile run failed before serving.",
+      "negative_control": "All eight workers failed at sp_shard(input_ids) in candidate-sp-eplb-retry.",
+      "result": "5 focused CPU cases pass at committed source; commit hooks and manual mypy3.12 pass. Real TP4/DP2 startup advances past token sharding, exposing a separate MoE dispatch configuration failure.",
+      "final_model_result": "TP4/DP2/EP8 + SP + DSpark5 + target-only synchronous EPLB passes 13 integration cases, checkpoint component graph replays, and the five-request load check at d6c94fa2e8b9d5f5233b559c69feeab28c94b886"
+    },
+    {
+      "commit": "935c68509f3b76269d76a364a77c34e5d9cf25ca",
+      "scope": "DeepSeek fused MoE sequence-parallel dispatch",
+      "reason": "The model passed sharded tokens to a fused MoE constructed with SP disabled, causing a DP local token-count assertion.",
+      "negative_control": "All eight workers fail in all2all.py dispatch size assertion at 6dfc982c6e.",
+      "result": "4 existing routing controls pass. Real TP4/DP2 model profiling passes dispatch, then the EPLB profiling collective fails on E8M0 scales. All non-mypy hooks pass; two MegaMoE kwargs type errors also reproduce on exact baseline78da347.",
+      "final_model_result": "TP4/DP2/EP8 + SP + DSpark5 + target-only synchronous EPLB passes 13 integration cases, checkpoint component graph replays, and the five-request load check at d6c94fa2e8b9d5f5233b559c69feeab28c94b886"
+    },
+    {
+      "commit": "d6c94fa2e8b9d5f5233b559c69feeab28c94b886",
+      "scope": "EPLB E8M0 expert-scale transfer views",
+      "reason": "EPLB exposes E8M0 tensors directly to collectives that reject the dtype; use storage-aliasing uint8 views for transfer only.",
+      "negative_control": "Real model profiling fails in NCCL all_gather; 2 E8M0 unit cases fail before the fix, while 2 BF16 controls pass.",
+      "result": "4 CPU storage cases, hooks and manual mypy3.12 pass; two-GPU NCCL/Gloo byte transfer checks pass; final real-model validation passes.",
+      "final_model_result": "TP4/DP2/EP8 + SP + DSpark5 + target-only synchronous EPLB passes 13 integration cases, checkpoint component graph replays, and the five-request load check at d6c94fa2e8b9d5f5233b559c69feeab28c94b886"
+    }
+  ],
+  "environment_repairs": [
+    "downloaded only public config/tokenizer fixtures for Qwen3-8B and its DFlash draft",
+    "guarded standalone pytest wrapper main() so torch multiprocessing spawn does not rerun pytest",
+    "Graph-only context probe omitted for eager serving: eager intentionally has no auxiliary graph-staging buffer; attempted probe restored all scratch bindings before returning its error."
+  ],
+  "native_abi_changes": false,
+  "known_static_failures": {
+    "deepseek_v4_model": {
+      "count": 2,
+      "keywords": [
+        "shared_x_sf",
+        "shared_block_m"
+      ],
+      "baseline_reproduced": true
+    },
+    "flashinfer_sparse": {
+      "count": 3,
+      "attributes": [
+        "decode_swa_width",
+        "max_decode_query_len",
+        "has_flashinfer_sparse_mla_sm120_config"
+      ],
+      "baseline_reproduced": true
+    }
+  },
+  "static_log_digests": {
+    "sp-moe-baseline-mypy312.log": "25d4e16a0b17a3f2cd3c37012e2b2b0e3388522a74d48a9f095f5b5e04f85476",
+    "sp-moe-mypy312.log": "25d4e16a0b17a3f2cd3c37012e2b2b0e3388522a74d48a9f095f5b5e04f85476",
+    "causal-image-baseline-mypy310.log": "af252f236c6b1b40aa876b811caae070f50254e4fb9cc36cb81eaae3265c14a0",
+    "causal-image-mypy312.log": "09bba2d85ce0867db1c174855f610d71ef7efd95c93de4c3b668251b232caeec"
+  },
+  "prior_startup_failures": [
+    {
+      "source_commit": "92b7822093adfbb784f82679c15322eac9dbe0cf",
+      "failure": "600-second engine startup timeout during checkpoint I/O; retry used 1800 seconds"
+    },
+    {
+      "source_commit": "92b7822093adfbb784f82679c15322eac9dbe0cf",
+      "failure": "1D token-ID assertion in sp_shard on all eight workers"
+    },
+    {
+      "source_commit": "6dfc982c6e033f6fabcfcc658fe9c4128191d1f6",
+      "failure": "MoE dispatch local token-count assertion on all eight workers"
+    },
+    {
+      "source_commit": "935c68509f3b76269d76a364a77c34e5d9cf25ca",
+      "failure": "NCCL all_gather rejects float8_e8m0fnu scales"
+    }
+  ],
+  "shutdown": {
+    "owned_servers_stopped": 10,
+    "gpu_compute_processes_remaining": 0,
+    "gpus_idle": 8,
+    "final_server_exit_code": 0,
+    "note": "NCCL store-disconnect and multiprocessing resource-tracker warnings occurred during teardown; no final-run serving request failed.",
+    "raw_record_sha256": "6787c0e882ff8f6cde009c33e1a1c98437992e043b35a272702425d3889b6d5b"
+  },
+  "negative_control_artifacts": {
+    "eplb_e8m0_before": {
+      "cases": [
+        {
+          "id": "tests.distributed.test_eplb_fused_moe_layer::test_eplb_weight_views_preserve_scale_storage[False-dtype0]",
+          "status": "failed"
+        },
+        {
+          "id": "tests.distributed.test_eplb_fused_moe_layer::test_eplb_weight_views_preserve_scale_storage[False-dtype1]",
+          "status": "passed"
+        },
+        {
+          "id": "tests.distributed.test_eplb_fused_moe_layer::test_eplb_weight_views_preserve_scale_storage[True-dtype0]",
+          "status": "failed"
+        },
+        {
+          "id": "tests.distributed.test_eplb_fused_moe_layer::test_eplb_weight_views_preserve_scale_storage[True-dtype1]",
+          "status": "passed"
+        }
+      ],
+      "raw_junit_sha256": "20b9cbb40c73af21138946c0e603660a81f8e0e2fc9abe8c25a99c67ea1714e9"
+    },
+    "routing_midrange_before": {
+      "failed": 4,
+      "passed": 12,
+      "raw_log_sha256": "8f54bba7a1be8772b4b61712f9d5433b936a8d486854772d91defb6bc2c5cad9"
+    }
+  }
+}
