@@ -393,6 +393,86 @@ def test_v41_image_swa_metadata_and_warmup_match_text():
     assert {key.COMPRESS_RATIO for key in image_keys} == {0, 1, 2}
 
 
+@pytest.mark.parametrize("compress_ratio", [1, 2])
+@pytest.mark.parametrize("reuse_workspace", [False, True])
+def test_v41_combine_preserves_invalid_topk_sentinels(compress_ratio, reuse_workspace):
+    """Invalid candidates must not become another request's or the SWA pool's rows."""
+    if not torch.accelerator.is_available():
+        pytest.skip("requires CUDA or ROCm")
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+        combine_topk_swa_indices,
+    )
+
+    device = torch.device("cuda")
+    n, window = 48 // compress_ratio, 4
+    m = n + window
+    candidates = [-1, -7, n, n + 1, 0, 1, n - 2, n - 1]
+    topk_indices = torch.tensor([candidates] * 2, dtype=torch.int32, device=device)
+    out = None
+    if reuse_workspace:
+        out = (
+            torch.full((2, 128), 123, dtype=torch.int32, device=device),
+            torch.full((2,), -123, dtype=torch.int32, device=device),
+        )
+    indices, lens = combine_topk_swa_indices(
+        topk_indices,
+        torch.tensor([7, 8, 9], dtype=torch.int32, device=device),
+        torch.tensor([48, 48], dtype=torch.int32, device=device),
+        torch.tensor([window, window], dtype=torch.int32, device=device),
+        window,
+        compress_ratio,
+        len(candidates),
+        m,
+        n,
+        out=out,
+    )
+    expected = torch.full_like(indices, -1)
+    for row in range(2):
+        base = m * row
+        valid = [base + value for value in candidates[4:]]
+        swa = [base + n + offset for offset in range(window)]
+        expected[row, :12] = torch.tensor([-1] * 4 + valid + swa, device=device)
+    assert lens.cpu().tolist() == [12] * 2
+    assert torch.equal(indices, expected)
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 1, 2])
+@pytest.mark.parametrize("seq_len", [0, 2])
+def test_v41_combine_clamps_negative_warmup_lengths(compress_ratio, seq_len):
+    """Synthetic warmup rows before position zero have no compressed or SWA entries."""
+    if not torch.accelerator.is_available():
+        pytest.skip("requires CUDA or ROCm")
+    from vllm.models.deepseek_v4_1.common.ops.cache_utils import (
+        combine_topk_swa_indices,
+    )
+
+    device = torch.device("cuda")
+    topk = 4 if compress_ratio else 0
+    n = seq_len // compress_ratio if compress_ratio else 0
+    m = n + 4
+    indices, lens = combine_topk_swa_indices(
+        torch.zeros((4, topk), dtype=torch.int32, device=device),
+        torch.tensor([7, 11], dtype=torch.int32, device=device),
+        torch.tensor([seq_len], dtype=torch.int32, device=device),
+        torch.tensor([seq_len], dtype=torch.int32, device=device),
+        4,
+        compress_ratio,
+        topk,
+        m,
+        n,
+    )
+    expected = torch.full_like(indices, -1)
+    expected_lens = []
+    for row, pos in enumerate(range(seq_len - 4, seq_len)):
+        num_compressed = max(0, (pos + 1) // compress_ratio) if compress_ratio else 0
+        swa = list(range(n, n + max(0, pos + 1)))
+        values = [0] * num_compressed + swa
+        expected_lens.append(len(values))
+        expected[row, : len(values)] = torch.tensor(values, device=device)
+    assert lens.cpu().tolist() == expected_lens
+    assert torch.equal(indices, expected)
+
+
 @pytest.mark.parametrize("compress_ratio", [0, 1, 2])
 @pytest.mark.parametrize("query_len", [100, 4000])
 @pytest.mark.parametrize("mixed", [False, True])
