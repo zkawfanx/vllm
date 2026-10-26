@@ -446,6 +446,9 @@ def test_v41_vision_routing_bias_and_padding(
         [False, False, True, False, False, False, True], device=device
     )
     logits[0] = -110.0
+    logits[1] = -18.0
+    logits[3] = -20.0
+    logits[4] = -15.0
     logits[padding] = float("nan")
     monkeypatch.setattr(fused_topk_bias_router, "_get_padding_mask", lambda _: padding)
 
@@ -467,7 +470,9 @@ def test_v41_vision_routing_bias_and_padding(
     )
     torch.testing.assert_close(actual[0], expected[0], atol=1e-6, rtol=1e-5)
     torch.testing.assert_close(actual[1], expected[1])
-    torch.testing.assert_close(actual[0][0], expected[0][0], atol=0, rtol=1e-5)
+    torch.testing.assert_close(
+        actual[0][~padding], expected[0][~padding], atol=0, rtol=1e-5
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")

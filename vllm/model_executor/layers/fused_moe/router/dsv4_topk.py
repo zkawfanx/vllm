@@ -4,7 +4,7 @@
 import torch
 
 from vllm.platforms import current_platform
-from vllm.triton_utils import tl, triton
+from vllm.triton_utils import tl, tldevice, triton
 
 _TOPK = 6
 
@@ -87,7 +87,9 @@ if current_platform.is_cuda():
             weights = tl.where(
                 logits < -20.0,
                 tl.exp(logits * 0.5),
-                tl.sqrt(tl.where(logits > 20.0, logits, tl.log(1.0 + tl.exp(logits)))),
+                tl.sqrt(
+                    tl.where(logits > 20.0, logits, tldevice.log1p(tl.exp(logits)))
+                ),
             )
         else:
             weights = tl.sqrt(
