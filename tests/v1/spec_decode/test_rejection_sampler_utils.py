@@ -550,10 +550,12 @@ def test_verify_rejects_unproposed_drafts(use_block_verification):
     # Resampled from the target at row 0, not from a residual.
     assert (sampled[:, 0] != 0).all()
 
-    # Once past the prefill, block verification accepts the same zero drafts.
+    # Block verification accepts the joint proposal after prefill. Standard
+    # verification still rejects the unlikely first zero token.
     prefill_len.copy_(first_pos)
     _, num_sampled = verify()
-    assert (num_sampled == K + 1).all()
+    expected_num_sampled = K + 1 if use_block_verification else 1
+    assert (num_sampled == expected_num_sampled).all()
 
 
 # The test above spreads its samples too thin to resolve a small distributional
