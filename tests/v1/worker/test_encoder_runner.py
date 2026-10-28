@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Tests for EncoderRunner.gather_mm_embeddings (model runner V2).
+"""Tests for model runner V2 encoder routing, capture, and embedding gathering.
 
 Covers the speculative-drafter encoder-cache handling: the drafter reads one
 position ahead of the target model (``draft_lookahead``). The +1 look-ahead
@@ -181,3 +181,219 @@ def test_gather_preserves_mixed_modalities():
     assert len(mm_embeds) == 2
     assert [e.modality for e in mm_embeds] == ["video", "audio"]
     assert int(is_mm_embed.sum()) == 8
+
+
+@pytest.fixture
+def graph_runner(monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu.mm import encoder_runner as module
+
+    events = []
+    managers = []
+    state = SimpleNamespace(fail_capture=False)
+
+    @contextmanager
+    def capture_context(**kwargs):
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    class Manager:
+        def __init__(self, **kwargs):
+            managers.append(self)
+            events.append("create")
+
+        def capture(self, graph_pool):
+            assert graph_pool == "encoder-pool"
+            events.append("capture")
+            if state.fail_capture:
+                raise RuntimeError("capture failed")
+
+        def clear(self):
+            events.append("clear")
+
+        def supports_modality(self, modality):
+            return modality == "image"
+
+        def execute(self, inputs):
+            events.append("graph")
+            return [inputs["value"].clone() + 20]
+
+    def eager(**inputs):
+        events.append("eager")
+        return [inputs["value"].clone() + 10]
+
+    monkeypatch.setattr(module, "EncoderCudaGraphManager", Manager)
+    monkeypatch.setattr(
+        module, "supports_encoder_cudagraph", lambda model: model.supported
+    )
+    monkeypatch.setattr(module, "graph_capture", capture_context)
+    monkeypatch.setattr(
+        module.current_platform, "graph_pool_handle", lambda: "encoder-pool"
+    )
+    monkeypatch.setattr(module.gc, "collect", lambda: events.append("collect"))
+    monkeypatch.setattr(torch.accelerator, "synchronize", lambda: events.append("sync"))
+    monkeypatch.setattr(
+        torch.accelerator, "empty_cache", lambda: events.append("empty")
+    )
+    memory = iter([1000, 750])
+
+    def get_memory():
+        events.append("memory")
+        return next(memory), 2000
+
+    monkeypatch.setattr(torch.accelerator, "get_memory_info", get_memory)
+    monkeypatch.setattr(module, "group_and_batch_mm_kwargs", lambda inputs, **_: inputs)
+
+    def make(enabled=True, supported=True, enforce_eager=False):
+        config = SimpleNamespace(
+            compilation_config=SimpleNamespace(cudagraph_mm_encoder=enabled),
+            model_config=SimpleNamespace(enforce_eager=enforce_eager),
+        )
+        return EncoderRunner(
+            model=SimpleNamespace(supported=supported, embed_multimodal=eager),
+            max_num_tokens=8,
+            hidden_size=HIDDEN,
+            encoder_cache=EncoderCache(),
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+            vllm_config=config,
+        )
+
+    return SimpleNamespace(make=make, events=events, managers=managers, state=state)
+
+
+@pytest.mark.parametrize(
+    "enabled,supported,enforce_eager",
+    [(False, True, False), (True, False, False), (True, True, True)],
+)
+def test_encoder_graph_disabled_or_unsupported_keeps_eager(
+    graph_runner, enabled, supported, enforce_eager
+):
+    runner = graph_runner.make(enabled, supported, enforce_eager)
+    assert runner.profile_cudagraph_memory() == 0
+    runner.capture_model()
+    value = torch.ones(2, HIDDEN)
+    output = runner.execute_mm_encoder([("image", 1, {"value": value})])
+    torch.testing.assert_close(output[0], value + 10)
+    assert graph_runner.events == ["eager"]
+    assert runner.encoder_cudagraph_manager is None
+
+
+def test_encoder_graph_routes_only_after_capture_and_preserves_other_modalities(
+    graph_runner,
+):
+    runner = graph_runner.make()
+    value = torch.ones(2, HIDDEN)
+    image = ("image", 1, {"value": value})
+    runner.execute_mm_encoder([image])
+    assert graph_runner.events == ["eager"]
+    runner.capture_model()
+    assert runner.encoder_cudagraph_manager is graph_runner.managers[0]
+    runner.capture_model()
+    assert len(graph_runner.managers) == 1
+    graph_runner.events.clear()
+    output = runner.execute_mm_encoder([image, ("audio", 1, {"value": value})])
+    runner.encoder_cache.encoder_outputs["saved"] = output[0]
+    runner.execute_mm_encoder([("image", 1, {"value": value * 3})])
+    torch.testing.assert_close(
+        runner.encoder_cache.encoder_outputs["saved"], value + 20
+    )
+    torch.testing.assert_close(output[1], value + 10)
+    assert graph_runner.events == ["graph", "eager", "graph"]
+    assert runner.execute_mm_encoder([]) == []
+    assert graph_runner.events == ["graph", "eager", "graph"]
+
+
+def test_encoder_graph_profile_uses_temporary_pool_and_keeps_serving_eager(
+    graph_runner,
+):
+    runner = graph_runner.make()
+    assert runner.profile_cudagraph_memory() == 250
+    assert runner.encoder_cudagraph_manager is None
+    assert graph_runner.events == [
+        "create",
+        "enter",
+        "sync",
+        "empty",
+        "memory",
+        "capture",
+        "sync",
+        "memory",
+        "exit",
+        "clear",
+        "collect",
+        "empty",
+    ]
+    runner.capture_model()
+    assert len(graph_runner.managers) == 2
+    assert runner.encoder_cudagraph_manager is graph_runner.managers[1]
+
+
+@pytest.mark.parametrize("method", ["profile_cudagraph_memory", "capture_model"])
+def test_encoder_graph_capture_failure_cleans_up_without_enabling_replay(
+    graph_runner, method
+):
+    runner = graph_runner.make()
+    graph_runner.state.fail_capture = True
+    with pytest.raises(RuntimeError, match="capture failed"):
+        getattr(runner, method)()
+    assert "clear" in graph_runner.events
+    assert runner.encoder_cudagraph_manager is None
+
+
+@pytest.mark.parametrize("capture_decoder", [False, True])
+def test_v2_runner_captures_encoder_after_decoder_and_counts_memory(
+    monkeypatch, capture_decoder
+):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu import model_runner as module
+
+    events = []
+    memory = iter([1000, 700])
+    monkeypatch.setattr(module.gc, "collect", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    monkeypatch.setattr(
+        torch.accelerator, "get_memory_info", lambda: (next(memory), 2000)
+    )
+    monkeypatch.setattr(module, "create_lora_capture_hook", lambda *_: None)
+    runner = module.GPUModelRunner.__new__(module.GPUModelRunner)
+    runner.supports_mm_inputs = runner.is_first_pp_rank = True
+    runner.cudagraph_manager = SimpleNamespace(
+        needs_capture=lambda: capture_decoder,
+        capture=lambda *args, **kwargs: events.append("decoder"),
+    )
+    runner.model_state = SimpleNamespace(
+        encoder_runner=SimpleNamespace(
+            cudagraph_enabled=True,
+            encoder_cudagraph_manager=None,
+            capture_model=lambda: events.append("encoder"),
+            profile_cudagraph_memory=lambda: 250,
+        )
+    )
+    runner.speculator = SimpleNamespace(capture=lambda: events.append("speculator"))
+    runner.maybe_setup_dummy_loras = lambda _: nullcontext()
+    runner.lora_config = None
+    runner.use_aux_hidden_state_outputs = False
+    for name in (
+        "model",
+        "input_buffers",
+        "intermediate_tensors",
+        "block_tables",
+        "attn_groups",
+        "kv_cache_config",
+    ):
+        setattr(runner, name, None)
+    assert runner.profile_cudagraph_memory() == 250
+    assert runner.capture_model() == 300
+    assert events == (["decoder", "speculator"] if capture_decoder else []) + [
+        "encoder"
+    ]
+    runner.is_first_pp_rank = False
+    assert runner.profile_cudagraph_memory() == 0
