@@ -98,7 +98,7 @@ def _ring_slot_mapping_kernel(
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
-    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.ALWAYS
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
