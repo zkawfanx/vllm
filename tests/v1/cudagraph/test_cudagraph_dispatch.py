@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
+from importlib import import_module
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -569,3 +570,59 @@ def test_nested_wrappers():
     assert action == "bypass"
     assert outer_model.forward.call_count == 2
     assert inner_model.forward.call_count == 1
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize(
+    "module_name,backend_name",
+    [
+        ("sparse_mla", "DeepseekV4FlashMLABackend"),
+        ("ampere.ampere_sparse", "DeepseekV41AmpereMLASparseBackend"),
+        ("nvidia.flashinfer_sparse", "DeepseekV4FlashInferMLASparseBackend"),
+        ("nvidia.flashinfer_sparse", "DeepseekSparseSWAFlashInferBackend"),
+        ("nvidia.flashmla", "DeepseekSparseSWAFlashMLABackend"),
+        ("compressor", "CompressorBackend"),
+    ],
+)
+@pytest.mark.parametrize("decode_width", [1, 6])
+@pytest.mark.parametrize(
+    "requested_mode,splitting_ops,mixed_mode",
+    [
+        ("FULL", None, CUDAGraphMode.PIECEWISE),
+        ("FULL", [], CUDAGraphMode.NONE),
+        ("FULL_AND_PIECEWISE", [], CUDAGraphMode.NONE),
+    ],
+)
+def test_dsv41_graphs_exclude_prefill_keep_uniform_decode(
+    module_name, backend_name, decode_width, requested_mode, splitting_ops, mixed_mode
+):
+    """Even FULL requests must not capture sparse prefill metadata (#59986).
+
+    Ampere inherits FlashMLA's builder; uniform DSpark5 decode must keep FULL
+    graphs, including when empty splitting_ops normalizes the requested mode.
+    """
+    backend = getattr(
+        import_module(f"vllm.models.deepseek_v4_1.{module_name}"), backend_name
+    )
+    comp_config = CompilationConfig(
+        mode=CompilationMode.VLLM_COMPILE,
+        cudagraph_mode=requested_mode,
+        splitting_ops=splitting_ops,
+        cudagraph_capture_sizes=[decode_width, 8 * decode_width],
+    )
+    config = _create_vllm_config(comp_config)
+    config.num_speculative_tokens = decode_width - 1
+    support = backend.get_builder_cls().get_cudagraph_support(config, None)
+    mode = comp_config.resolve_cudagraph_mode_and_sizes(
+        support, backend_name, uniform_decode_query_len=decode_width
+    )
+    dispatcher = CudagraphDispatcher(config)
+    dispatcher.initialize_cudagraph_keys(mode, decode_width)
+
+    assert dispatcher.dispatch(8 * decode_width, uniform_decode=False)[0] == mixed_mode
+    decode_mode, key = dispatcher.dispatch(8 * decode_width, uniform_decode=True)
+    assert decode_mode == CUDAGraphMode.FULL
+    assert key.uniform
+    assert key.num_reqs == 8
+    assert all(key.uniform for key in dispatcher.cudagraph_keys[CUDAGraphMode.FULL])
