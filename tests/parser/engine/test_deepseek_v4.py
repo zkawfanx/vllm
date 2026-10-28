@@ -119,6 +119,23 @@ class TestArgConverter:
         result = json.loads(_dsml_arg_converter("", partial=False))
         assert result == {}
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [("alpha", "alpha"), ("7", 7), ('{"k": [true, null]}', {"k": [True, None]})],
+    )
+    def test_missing_string_attribute_keeps_literal_or_json(self, value, expected):
+        raw = f'<｜DSML｜parameter name="value">{value}{_PARAM_CLOSE}'
+        assert json.loads(_dsml_arg_converter(raw, partial=False)) == {
+            "value": expected,
+        }
+
+    def test_missing_string_attribute_partial_value(self):
+        raw = _param("a", "true", "x") + '<｜DSML｜parameter name="n">12'
+        assert json.loads(_dsml_arg_converter(raw, partial=True)) == {
+            "a": "x",
+            "n": 12,
+        }
+
     def test_invalid_json_fallback(self):
         raw = self._raw(("data", "false", "[broken"))
         result = json.loads(_dsml_arg_converter(raw, partial=False))
@@ -165,6 +182,32 @@ class TestArgConverter:
         result = json.loads(_dsml_arg_converter(raw, partial=False))
         assert result["n"] == "42"
         assert isinstance(result["n"], str)
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_missing_string_attribute_keeps_parameter(
+    mock_tokenizer, mock_request, streaming
+):
+    chunks = [
+        DSML_TOOL_START,
+        f"{DSML_INVOKE_PREFIX}get_weather{DSML_INVOKE_NAME_END}\n",
+        '<｜DSML｜parameter name="loc',
+        'ation">Par',
+        "is",
+        _PARAM_CLOSE,
+        f"\n{_param('date', 'true', 'tomorrow')}\n",
+        DSML_INVOKE_END,
+        DSML_TOOL_END,
+    ]
+    parser = DeepSeekV4Parser(mock_tokenizer)
+    if streaming:
+        results = simulate_tool_streaming(parser, mock_request, chunks)
+        arguments = collect_tool_arguments(results)
+    else:
+        result = parser.extract_tool_calls("".join(chunks), mock_request)
+        assert result.tools_called and len(result.tool_calls) == 1
+        arguments = result.tool_calls[0].function.arguments
+    assert json.loads(arguments) == {"location": "Paris", "date": "tomorrow"}
 
 
 # ── Bare </think> absorption and duplicate <think> absorption ─────────

@@ -171,7 +171,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # site gets its own pool so a buffer is recycled once per
         # max_concurrency steps, not once per max_concurrency copies. Sizes are
         # exact upper bounds, so these never grow during serving.
-        self._idx_mapping_staging = PinnedStagingPool(torch.int32)
+        self._idx_mapping_staging = PinnedStagingPool(torch.int64)
         self._cu_num_logits_staging = PinnedStagingPool(torch.int32)
         self._query_start_loc_staging = PinnedStagingPool(torch.int32)
         self._idx_mapping_staging.reserve(self.max_num_reqs)
@@ -963,14 +963,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
 
         idx_mapping_iter = map(self.req_states.req_id_to_index.get, req_ids)
-        idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int32, count=num_reqs)
+        idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.int64, count=num_reqs)
         # A fresh device tensor per step, as before: idx_mapping is held on the
         # InputBatch until sample_tokens, which is a later RPC, so it must not
         # alias a buffer the next step can overwrite. Only the pinned staging
         # is pooled.
         idx_mapping = self._idx_mapping_staging.copy_to_gpu(
             idx_mapping_np,
-            out=torch.empty(num_reqs, dtype=torch.int32, device=self.device),
+            out=torch.empty(num_reqs, dtype=torch.int64, device=self.device),
         )
 
         # Get the number of draft tokens for each request.

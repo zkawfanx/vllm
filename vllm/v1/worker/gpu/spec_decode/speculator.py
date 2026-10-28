@@ -111,7 +111,7 @@ class DraftModelSpeculator(BaseSpeculator):
             device=device,
         )
         self.idx_mapping = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device=device
+            self.max_num_reqs, dtype=torch.int64, device=device
         )
         self.temperature = torch.zeros(
             self.max_num_reqs, dtype=torch.float32, device=device
@@ -284,8 +284,7 @@ class DraftModelSpeculator(BaseSpeculator):
                 "avoids materializing."
             )
         missing = [
-            name for name in self._local_argmax_hooks
-            if not hasattr(self.model, name)
+            name for name in self._local_argmax_hooks if not hasattr(self.model, name)
         ]
         if missing:
             raise ValueError(
@@ -307,7 +306,7 @@ class DraftModelSpeculator(BaseSpeculator):
     def sample_draft(
         self,
         hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+        sample_src_positions: torch.Tensor,
         idx_mapping: torch.Tensor,
         temperature: torch.Tensor,
         seeds: torch.Tensor,
@@ -316,15 +315,14 @@ class DraftModelSpeculator(BaseSpeculator):
     ) -> torch.Tensor:
         if draft_logits is not None:
             logits = self.model.compute_logits(hidden_states)
-            # NOTE(woosuk): We must add 1 to the positions to match the Gumbel noise
-            # used for draft and target sampling.
             return gumbel_sample(
                 logits,
                 idx_mapping,
                 temperature,
                 seeds,
-                positions + 1,
+                sample_src_positions,
                 apply_temperature=True,
+                is_drafting=True,
                 output_processed_logits=draft_logits,
                 output_processed_logits_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,

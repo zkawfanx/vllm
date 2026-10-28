@@ -1723,3 +1723,33 @@ def test_load_config_rejects_invalid_safetensors_load_strategy():
 def test_load_config_rejects_non_string_load_format(bad_load_format):
     with pytest.raises(pydantic.ValidationError):
         LoadConfig(load_format=bad_load_format)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("parallel_kwargs", [{"enable_dbo": True}, {"ubatch_size": 2}])
+@pytest.mark.parametrize("is_draft", [False, True])
+def test_engram_rejects_overlapping_microbatches_before_offload_defaults(
+    monkeypatch, parallel_kwargs, is_draft
+):
+    """Persistent Engram rows cannot be shared by overlapping microbatches."""
+    monkeypatch.setattr(envs, "VLLM_PLE_CPU_OFFLOAD", False)
+    target = SimpleNamespace(
+        architecture="DeepseekV41ForCausalLM",
+        hf_text_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+    )
+    draft = SimpleNamespace()
+    config = SimpleNamespace(
+        engram_config=None,
+        model_config=draft if is_draft else target,
+        speculative_config=SimpleNamespace(
+            draft_model_config=draft, target_model_config=target
+        )
+        if is_draft
+        else None,
+        parallel_config=ParallelConfig(**parallel_kwargs),
+    )
+    with pytest.raises(ValueError, match="Engram does not support DBO"):
+        VllmConfig._resolve_and_verify_engram_config(config)
+    target.hf_text_config.engram_layer_ids = []
+    VllmConfig._resolve_and_verify_engram_config(config)
+    assert config.engram_config is None

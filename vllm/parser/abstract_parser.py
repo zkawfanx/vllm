@@ -547,6 +547,12 @@ class DelegatingParser(Parser):
         if structure_tag is None:
             return request
 
+        if request.parallel_tool_calls is False:
+            from vllm.tool_parsers.structural_tag_registry import (
+                limit_to_single_tool_call,
+            )
+
+            limit_to_single_tool_call(structure_tag)
         structural_tag = json.dumps(structure_tag.model_dump())
         request.structured_outputs = StructuredOutputsParams(
             structural_tag=structural_tag,

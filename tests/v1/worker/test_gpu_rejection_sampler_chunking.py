@@ -13,6 +13,7 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import (
     RejectionSampler,
     _iter_request_chunks,
+    gather_draft_sampled,
 )
 
 
@@ -107,3 +108,24 @@ def test_chunked_scores_match_full_batch(logprobs_mode: str):
         chunked_logprobs.cu_num_generated_tokens
         == full_logprobs.cu_num_generated_tokens
     )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("token_dtype", [torch.int32, torch.int64])
+def test_gather_draft_sampled_masks_only_unproposed_rows(token_dtype):
+    """Mixed requests preserve decode drafts and reject prefill placeholders."""
+    device = "cuda"
+    input_ids = torch.arange(10, 19, dtype=token_dtype, device=device)
+    positions = torch.arange(8, 17, dtype=torch.int64, device=device)
+    logits_indices = torch.tensor([4, 5, 6, 0, 1, 2, 7, 8], device=device)
+    req_mapping = torch.tensor([2, 2, 2, 1, 1, 1, 0, 0], device=device)
+    local_pos = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1], device=device)
+    prefill_len = torch.tensor([15, 9, 12], device=device)
+
+    sampled, pos = gather_draft_sampled(
+        input_ids, positions, logits_indices, req_mapping, local_pos, prefill_len
+    )
+
+    assert sampled.tolist() == [14, 15, 16, 10, -1, -1, 17, 18]
+    assert pos.tolist() == [12, 13, 14, 8, 9, 10, 15, 16]
+    assert sampled.dtype == token_dtype

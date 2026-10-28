@@ -21,6 +21,116 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("vision", [False, True])
+@pytest.mark.parametrize("layer_id,num_experts,top_k", [(0, 8, 2), (2, 4, 3)])
+def test_deepseek_v41_fused_moe_routes_image_sentinels_without_hash_table(
+    monkeypatch, vision, layer_id, num_experts, top_k
+):
+    """Exercise public fallback dispatch; replace only GPU linear/expert kernels."""
+    import vllm.models.deepseek_v4.nvidia.model as v4_model
+    from vllm.model_executor.layers.fused_moe.router import fused_topk_bias_router
+    from vllm.models.deepseek_v4_1.common.mm_preprocess import IMAGE_SENTINEL_BASE_ID
+    from vllm.models.deepseek_v4_1.nvidia.model import DeepseekV4MoE as V41MoE
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+    class CPUGate(torch.nn.Linear):
+        def __init__(self, input_size, output_size, **kwargs):
+            super().__init__(input_size, output_size, bias=False)
+
+        def forward(self, x):
+            return super().forward(x), None
+
+    class CPUExperts(torch.nn.Module):
+        is_internal_router = True
+
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.gate = kwargs["gate"]
+            self.router = fused_topk_bias_router.FusedTopKBiasRouter(
+                top_k=kwargs["top_k"],
+                global_num_experts=kwargs["num_experts"],
+                e_score_correction_bias=kwargs["e_score_correction_bias"],
+                hash_indices_table=kwargs["hash_indices_table"],
+                scoring_func=kwargs["scoring_func"],
+                routed_scaling_factor=kwargs["routed_scaling_factor"],
+                renormalize=kwargs["renormalize"],
+            )
+
+        def forward(self, hidden_states, router_logits, input_ids):
+            router_logits, _ = self.gate(router_logits)
+            self.weights, self.ids = self.router.select_experts(
+                hidden_states, router_logits, torch.int32, input_ids=input_ids
+            )
+            return hidden_states + (self.weights * (self.ids + 1)).sum(-1, keepdim=True)
+
+    monkeypatch.setattr(v4_model, "GateLinear", CPUGate)
+    monkeypatch.setattr(v4_model, "FusedMoEFactory", CPUExperts)
+    monkeypatch.setattr(v4_model, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(v4_model, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        fused_topk_bias_router,
+        "vllm_topk_softplus_sqrt",
+        fused_topk_bias_router._topk_softplus_sqrt_torch,
+    )
+    config = DeepseekV41Config(
+        text_config=dict(
+            hidden_size=4,
+            num_hidden_layers=2,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            dspark_n_routed_experts=4,
+            dspark_num_experts_per_tok=3,
+            n_shared_experts=None,
+            moe_intermediate_size=8,
+            swiglu_limit=10.0,
+            num_hash_layers=1,
+            norm_topk_prob=True,
+            topk_method="noaux_tc",
+            routed_scaling_factor=1.5,
+        ),
+    )
+    config.vision_n_layers = int(vision)
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=config),
+        quant_config=None,
+        kernel_config=SimpleNamespace(moe_backend="auto"),
+        parallel_config=SimpleNamespace(
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
+    )
+    moe = V41MoE(vllm_config, prefix=f"model.layers.{layer_id}.ffn")
+    hidden_states = torch.arange(24, dtype=torch.float32).view(6, 4) / 24
+    base = IMAGE_SENTINEL_BASE_ID
+    input_ids = torch.tensor([42, base - 1, base, base + 1, base + 4, base + 5])
+    with torch.no_grad():
+        moe.gate.weight.copy_(torch.arange(num_experts * 4).view(num_experts, 4) / 32)
+        moe.gate.e_score_correction_bias.copy_(torch.arange(num_experts))
+        if vision:
+            moe.gate.bias_vl.copy_(-torch.arange(num_experts, dtype=torch.float32) * 10)
+
+    scores = torch.nn.functional.softplus(
+        torch.nn.functional.linear(hidden_states, moe.gate.weight)
+    ).sqrt()
+    bias = moe.gate.e_score_correction_bias
+    if vision:
+        image_mask = (input_ids >= base) & (input_ids < base + 5)
+        bias = torch.where(image_mask[:, None], moe.gate.bias_vl, bias)
+    expected_ids = (scores + bias).topk(top_k, dim=-1).indices
+    expected_weights = scores.gather(1, expected_ids)
+    expected_weights *= 1.5 / expected_weights.sum(-1, keepdim=True)
+    expected = hidden_states + (expected_weights * (expected_ids + 1)).sum(
+        -1, keepdim=True
+    )
+
+    actual = moe(hidden_states, input_ids if vision else None)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(moe.experts.ids.long(), expected_ids)
+    torch.testing.assert_close(moe.experts.weights, expected_weights)
+    assert moe.gate.tid2eid is None
+    assert (config.n_routed_experts, config.num_experts_per_tok) == (8, 2)
+
+
 def test_deepseek_v4_mega_moe_expert_mapping():
     mapping = make_deepseek_v4_expert_params_mapping(2)
 

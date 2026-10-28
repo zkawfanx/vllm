@@ -185,6 +185,9 @@ steps:
   source_file_dependencies:
   - examples/features/torchrun/torchrun_dp_example_offline.py
   - vllm/config/parallel.py
+  - vllm/config/vllm.py
+  - vllm/models/deepseek_v4_1/
+  - tests/kernels/test_engram.py
   - vllm/distributed/
   - vllm/v1/engine/llm_engine.py
   - vllm/v1/executor/uniproc_executor.py
@@ -194,6 +197,7 @@ steps:
   commands:
   # https://github.com/NVIDIA/nccl/issues/1838
   - export NCCL_CUMEM_HOST_ENABLE=0
+  - pytest -v -s kernels/test_engram.py::test_engram_head_collectives_survive_graph_breaks
   # test with torchrun tp=2 and dp=4 with ep
   - torchrun --nproc-per-node=8 ../examples/features/torchrun/torchrun_dp_example_offline.py --tp-size=2 --pp-size=1 --dp-size=4 --enable-ep
 

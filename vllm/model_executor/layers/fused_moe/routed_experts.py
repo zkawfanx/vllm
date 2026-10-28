@@ -1184,8 +1184,13 @@ class RoutedExperts(PluggableLayer):
             and name not in NON_EXPERT_WEIGHTS
         )
 
+        # Collectives do not support E8M0; EPLB only needs to copy its bytes.
         return [
-            weight.view(self.local_num_experts, -1)
+            (
+                weight.view(torch.uint8)
+                if weight.dtype == torch.float8_e8m0fnu
+                else weight
+            ).view(self.local_num_experts, -1)
             for name, weight in weights
             if name not in NON_EXPERT_WEIGHTS
             and weight.shape != torch.Size([])

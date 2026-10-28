@@ -118,6 +118,31 @@ def safe_resize(
     return n_llm_h, n_llm_w, best_height, best_width
 
 
+def _get_image_geometry(
+    height: float,
+    width: float,
+    *,
+    patch_size: int,
+    downsample_ratio: int,
+    max_n_token: int,
+    min_pixels: int,
+    max_wh_ratio: float | None,
+) -> tuple[int, int, int, int]:
+    """Return the LLM grid and pixel dimensions after image preprocessing."""
+    p = patch_size
+    if max_wh_ratio is not None and width > height * max_wh_ratio:
+        width = height * max_wh_ratio
+    if 0 < width * height < min_pixels:
+        ratio = (min_pixels / (width * height)) ** 0.5
+        width = int(width * ratio)
+        height = int(height * ratio)
+    best_width = math.ceil(width / p) * p
+    best_height = math.ceil(height / p) * p
+    return safe_resize(
+        height, width, best_height, best_width, p, downsample_ratio, max_n_token
+    )
+
+
 def load_image(
     image: Image.Image,
     *,
@@ -134,17 +159,14 @@ def load_image(
     """
     p = patch_size
     image = image.convert("RGB")
-    width, height = image.size
-    if max_wh_ratio is not None and width > height * max_wh_ratio:
-        width = height * max_wh_ratio
-    if 0 < width * height < min_pixels:
-        ratio = (min_pixels / (width * height)) ** 0.5
-        width = int(width * ratio)
-        height = int(height * ratio)
-    best_width = math.ceil(width / p) * p
-    best_height = math.ceil(height / p) * p
-    n_llm_h, n_llm_w, best_height, best_width = safe_resize(
-        height, width, best_height, best_width, p, downsample_ratio, max_n_token
+    n_llm_h, n_llm_w, best_height, best_width = _get_image_geometry(
+        image.height,
+        image.width,
+        patch_size=p,
+        downsample_ratio=downsample_ratio,
+        max_n_token=max_n_token,
+        min_pixels=min_pixels,
+        max_wh_ratio=max_wh_ratio,
     )
     n_vit_h, n_vit_w = best_height // p, best_width // p
     if max_wh_ratio is not None and image.width >= max_wh_ratio * image.height:
@@ -275,15 +297,60 @@ class DeepseekV4VLProcessingInfo(BaseProcessingInfo):
         hf_config = self.get_hf_config()
         patch_size = hf_config.vision_patch_size
         downsample_ratio = hf_config.vision_downsample_ratio
-        # A square maximizes the ViT patch count (area) within the token
-        # budget; solve the budget-derived size directly to keep the dummy
-        # image small.
         budget = hf_config.vision_max_n_token
-        side = budget * patch_size * downsample_ratio
-        best_h, best_w = solve_resize_ratio(
-            side, side, patch_size, downsample_ratio, budget
+        max_wh_ratio = hf_config.vision_max_wh_ratio
+        grids: list[tuple[int, int]] = []
+        # A clamp-edge grid can lose patches when min-pixel scaling causes
+        # safe_resize to round down. Also try a complete aligner-cell width.
+        for n_llm_h in range(1, (budget - 2) // 2 + 1):
+            n_vit_h = n_llm_h * downsample_ratio
+            n_vit_w = ((budget - 2) // n_llm_h - 1) * downsample_ratio
+            widths = [n_vit_w]
+            if max_wh_ratio is not None:
+                widths = [
+                    min(n_vit_w, math.ceil(n_vit_h * max_wh_ratio)),
+                    min(
+                        n_vit_w,
+                        math.floor(n_llm_h * max_wh_ratio) * downsample_ratio,
+                    ),
+                ]
+            grids.extend((n_vit_h, width) for width in widths if width > 0)
+        if grids:
+            # The very-tall single-column fallback can exceed the ratio clamp.
+            grids.append(((budget - 2) * downsample_ratio, downsample_ratio))
+
+        best_size = None
+        max_patches = 0
+        # This area exceeds every grid that fits the token budget.
+        min_area = max(
+            hf_config.vision_min_pixels,
+            patch_size**2 * downsample_ratio**2 * (budget - 2),
         )
-        return ImageSize(width=best_w, height=best_h)
+        for n_vit_h, n_vit_w in grids:
+            height, width = n_vit_h * patch_size, n_vit_w * patch_size
+            # Cover both patch rounding and token-budget downscaling.
+            scale = 1
+            while height * width * scale * scale < min_area:
+                scale *= 2
+            for factor in (1, scale):
+                _, _, resized_h, resized_w = _get_image_geometry(
+                    height * factor,
+                    width * factor,
+                    patch_size=patch_size,
+                    downsample_ratio=downsample_ratio,
+                    max_n_token=budget,
+                    min_pixels=hf_config.vision_min_pixels,
+                    max_wh_ratio=max_wh_ratio,
+                )
+                patches = (resized_h // patch_size) * (resized_w // patch_size)
+                if patches > max_patches:
+                    max_patches = patches
+                    best_size = ImageSize(width=width * factor, height=height * factor)
+        if best_size is None:
+            raise ValueError(
+                "Image token budget and aspect ratio allow no image patches"
+            )
+        return best_size
 
 
 class DeepseekV4VLDummyInputsBuilder(
@@ -325,7 +392,9 @@ class DeepseekV4VLMultiModalProcessor(
             prompt, mm_data, mm_kwargs, tok_kwargs
         )
         processed_data["input_ids"] = [
-            self.info.get_tokenizer().encode(prompt, **tok_kwargs)
+            self.info.get_tokenizer().encode(
+                prompt, **cast(Mapping[str, Any], tok_kwargs)
+            )
         ]
         return processed_data
 

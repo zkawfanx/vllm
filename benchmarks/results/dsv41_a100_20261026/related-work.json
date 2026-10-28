@@ -1,0 +1,156 @@
+{
+  "checked_on": "2026-10-26",
+  "target": {"repository": "zkawfanx/vllm", "base": "codex/dsv41-flash-a100", "roadmap": "https://github.com/zkawfanx/vllm/issues/18"},
+  "disposition": "Fork integration/backport draft. No competing upstream PR is being proposed. The only open fork PR is #19, whose common-device mapping optimization is excluded; the MRV2 int64 overflow fix here is a different change.",
+  "issue_checks": ["gh issue view 18 --repo zkawfanx/vllm --comments", "gh issue view 56208 --repo vllm-project/vllm --comments"],
+  "searches": [
+    {
+      "query": "Responses \"item IDs\"",
+      "repository": "vllm-project/vllm",
+      "state": "open",
+      "results": [
+        {"number": 56285, "title": "[Bugfix][Frontend] Improve Responses API compatibility for Codex clients", "url": "https://github.com/vllm-project/vllm/pull/56285"},
+        {"number": 58018, "title": "[Bugfix][Frontend] Fix Responses item status and Harmony event lifecycle", "url": "https://github.com/vllm-project/vllm/pull/58018"},
+        {"number": 35508, "title": "[Responses] Normalize OpenResponses input items to match openai-python SDK requirements", "url": "https://github.com/vllm-project/vllm/pull/35508"},
+        {"number": 46427, "title": "[rust][server] Add generative scoring route", "url": "https://github.com/vllm-project/vllm/pull/46427"}
+      ]
+    },
+    {
+      "query": "\"get_expert_weights\"",
+      "repository": "vllm-project/vllm",
+      "state": "open",
+      "results": [
+        {"number": 63075, "title": "[Bugfix][EPLB] Give EPLB each expert-weight region once", "url": "https://github.com/vllm-project/vllm/pull/63075"},
+        {"number": 47588, "title": "[Bugfix] [EPLB]  Avoid Silent Accuracy Corruption in Quark MXFP4 EPLB", "url": "https://github.com/vllm-project/vllm/pull/47588"},
+        {"number": 41412, "title": "[Model] Add MixtureOfExperts support for PhiMoE", "url": "https://github.com/vllm-project/vllm/pull/41412"}
+      ]
+    },
+    {
+      "query": "\"sp_shard\"",
+      "repository": "vllm-project/vllm",
+      "state": "open",
+      "results": [
+        {"number": 51346, "title": "[XPU] Add sequence parallelism support for DeepSeek V4", "url": "https://github.com/vllm-project/vllm/pull/51346"},
+        {"number": 59693, "title": "[ROCm][Perf] Kimi-K3: token-sharded residual stream for long prefills", "url": "https://github.com/vllm-project/vllm/pull/59693"}
+      ]
+    },
+    {
+      "query": "\"softplus\" \"vision\"",
+      "repository": "vllm-project/vllm",
+      "state": "open",
+      "results": [
+        {"number": 63687, "title": "[Bugfix][MoE] Fall back to torch routing for unsupported sqrtsoftplus expert counts", "url": "https://github.com/vllm-project/vllm/pull/63687"}
+      ]
+    },
+    {
+      "query": "\"is_sequence_parallel\" \"DeepSeek\"",
+      "repository": "vllm-project/vllm",
+      "state": "open",
+      "results": [
+        {"number": 51346, "title": "[XPU] Add sequence parallelism support for DeepSeek V4", "url": "https://github.com/vllm-project/vllm/pull/51346"},
+        {"number": 62947, "title": "[Bugfix] deepseek_v32: honor the decoder's deferred MoE all-reduce on the naive all2all path", "url": "https://github.com/vllm-project/vllm/pull/62947"},
+        {"number": 54134, "title": "[ROCm][DeepSeek V4] Enable FHMoE with DP8 over RCCL", "url": "https://github.com/vllm-project/vllm/pull/54134"}
+      ]
+    }
+  ],
+  "related": [
+    {"number": 61786, "url": "https://github.com/vllm-project/vllm/pull/61786", "title": "[Bugfix][EPLB] Move 1-byte expert tensors as uint8 views", "merge_commit": "876d5da8316a81180b8c7f10dea5ffab5b5a849f", "disposition": "Merged upstream byte-view EPLB transfer analogue. The fork's correction exposes E8M0-only byte views from RoutedExperts.get_expert_weights; this is narrower than the upstream one-byte tensor treatment and separate from alias-region deduplication #63075. Added during follow-up review; not part of the original search transcript."},
+    {"number": 51346, "url": "https://github.com/vllm-project/vllm/pull/51346", "disposition": "Open XPU sequence-parallel enablement; this change fixes the fork's A100 token-ID sharding and MoE dispatch."},
+    {"number": 54064, "url": "https://github.com/vllm-project/vllm/pull/54064", "title": "[Responses] Implement usage tracking, streaming final items, incomplete_reason, and MCP/builtin tool rendering", "disposition": "Open broader Responses proposal overlaps streamed final-item accumulation; no competing upstream PR is proposed."},
+    {"number": 56285, "url": "https://github.com/vllm-project/vllm/pull/56285", "title": "[Bugfix][Frontend] Improve Responses API compatibility for Codex clients", "disposition": "Open broader Responses compatibility proposal overlaps IDs/logprobs and includes unrelated custom-tool and reasoning features."},
+    {"number": 58018, "url": "https://github.com/vllm-project/vllm/pull/58018", "title": "[Bugfix][Frontend] Fix Responses item status and Harmony event lifecycle", "disposition": "Open item-status/Harmony lifecycle proposal; its zero-delta Harmony behavior remains the existing expected failure here."},
+    {"number": 59307, "url": "https://github.com/vllm-project/vllm/pull/59307", "title": "[Bugfix][Responses API] Build streamed final response from streamed items", "disposition": "Merged non-Harmony streamed-item reuse fix. The local Responses correction implements the same contract on the fork's older code; it is not a novel upstream proposal."},
+    {"number": 59859, "url": "https://github.com/vllm-project/vllm/pull/59859", "title": "[Bugfix][Responses API] Reuse streamed item ids in final harmony response", "disposition": "Merged Harmony item-ID fix; Harmony implementation parity is outside this patch."},
+    {"number": 63075, "url": "https://github.com/vllm-project/vllm/pull/63075", "title": "[Bugfix][EPLB] Give EPLB each expert-weight region once", "disposition": "Open EPLB alias-region deduplication fix; distinct from transferring unsupported E8M0 dtype through byte views."},
+    {"number": 63687, "url": "https://github.com/vllm-project/vllm/pull/63687", "title": "[Bugfix][MoE] Fall back to torch routing for unsupported sqrtsoftplus expert counts", "disposition": "Open generic unsupported-expert-count routing fallback; related to the fallback area, but this fork change restores V4.1 image bias and negative-logit numerics on the existing SM80 stack."}
+  ],
+  "cli_searches": [
+    {
+      "argv": ["gh", "pr", "list", "--repo", "zkawfanx/vllm", "--state", "open", "--search", "18 in:body", "--limit", "100", "--json", "number,title,url,headRefName,baseRefName,isDraft"],
+      "returned_count": 1,
+      "limit_reached": false,
+      "results": [
+        {"baseRefName": "codex/dsv41-flash-a100", "headRefName": "codex/dsv41-backport-mapping", "isDraft": true, "number": 19, "title": "[A100][Backport] Common device token mapping (#56562)", "url": "https://github.com/zkawfanx/vllm/pull/19"}
+      ],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    },
+    {
+      "argv": ["gh", "pr", "list", "--repo", "zkawfanx/vllm", "--state", "open", "--search", "DeepSeek", "--limit", "100", "--json", "number,title,url,headRefName,baseRefName,isDraft"],
+      "returned_count": 1,
+      "limit_reached": false,
+      "results": [
+        {"baseRefName": "codex/dsv41-flash-a100", "headRefName": "codex/dsv41-backport-mapping", "isDraft": true, "number": 19, "title": "[A100][Backport] Common device token mapping (#56562)", "url": "https://github.com/zkawfanx/vllm/pull/19"}
+      ],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    },
+    {
+      "argv": ["gh", "pr", "list", "--repo", "vllm-project/vllm", "--state", "open", "--search", "56208 in:body", "--limit", "100", "--json", "number,title,url,headRefName,baseRefName,isDraft"],
+      "returned_count": 1,
+      "limit_reached": false,
+      "results": [
+        {"baseRefName": "main", "headRefName": "fix-dsv41-v4-dsml-spellings", "isDraft": false, "number": 62517, "title": "[Bugfix][Parser] DeepSeek V4.1: don't leak a `<｜DSML｜ tool_calls>` opener into content", "url": "https://github.com/vllm-project/vllm/pull/62517"}
+      ],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    },
+    {
+      "argv": ["gh", "pr", "list", "--repo", "vllm-project/vllm", "--state", "open", "--search", "DeepSeek V4.1", "--limit", "100", "--json", "number,title,url,headRefName,baseRefName,isDraft"],
+      "returned_count": 100,
+      "limit_reached": true,
+      "results": [],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    },
+    {
+      "argv": [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        "vllm-project/vllm",
+        "--state",
+        "open",
+        "--search",
+        "Responses streaming",
+        "--limit",
+        "100",
+        "--json",
+        "number,title,url,headRefName,baseRefName,isDraft"
+      ],
+      "returned_count": 100,
+      "limit_reached": true,
+      "results": [],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    },
+    {
+      "argv": ["gh", "pr", "list", "--repo", "vllm-project/vllm", "--state", "open", "--search", "E8M0 EPLB", "--limit", "100", "--json", "number,title,url,headRefName,baseRefName,isDraft"],
+      "returned_count": 3,
+      "limit_reached": false,
+      "results": [
+        {"baseRefName": "main", "headRefName": "aakif/rocm-mxfp8-moe-aiter-a8w8", "isDraft": true, "number": 61214, "title": "[ROCm][MoE] MXFP8 MoE via AITER moe_gemm_a8w8 on gfx942", "url": "https://github.com/vllm-project/vllm/pull/61214"},
+        {"baseRefName": "main", "headRefName": "rocm/qwen38-mono-decode", "isDraft": true, "number": 60833, "title": "[ROCm][Perf][Qwen3.8] Mono decode layer for Qwen3.8 on MI355X", "url": "https://github.com/vllm-project/vllm/pull/60833"},
+        {"baseRefName": "main", "headRefName": "codex/ds4-sm120-min-enable", "isDraft": false, "number": 41834, "title": "[New Model][Nvidia] Add SM12x support for DeepSeek V4 Flash with essential fixes", "url": "https://github.com/vllm-project/vllm/pull/41834"}
+      ],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    },
+    {
+      "argv": [
+        "gh",
+        "pr",
+        "list",
+        "--repo",
+        "vllm-project/vllm",
+        "--state",
+        "open",
+        "--search",
+        "sequence parallel MoE",
+        "--limit",
+        "100",
+        "--json",
+        "number,title,url,headRefName,baseRefName,isDraft"
+      ],
+      "returned_count": 100,
+      "limit_reached": true,
+      "results": [],
+      "note": "Broad searches reaching 100 results are discovery only, not exhaustive absence evidence."
+    }
+  ]
+}

@@ -11,7 +11,7 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     get_routing_method_type,
 )
-from vllm.model_executor.layers.fused_moe.router.dsv4_topk import dsv4_topk
+from vllm.model_executor.layers.fused_moe.router.dsv4_topk import can_use_dsv4_topk
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
     fused_topk_bias,
 )
@@ -190,48 +190,107 @@ def test_fused_topk_softplus_sqrt_hash(
     torch.testing.assert_close(sorted_w_ref, sorted_w, atol=2e-2, rtol=1e-2)
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "num_experts,topk,indices_type,expected",
+    [
+        (384, 6, torch.int32, True),
+        (384, 6, torch.uint32, False),
+        (128, 3, torch.int32, False),
+    ],
+)
+def test_dsv4_padding_route_eligibility(
+    monkeypatch, num_experts, topk, indices_type, expected
+):
+    monkeypatch.setattr(current_platform, "is_cuda", lambda: True)
+    logits = torch.zeros(1, num_experts)
+    assert (
+        can_use_dsv4_topk(logits, torch.zeros(num_experts), topk, True, indices_type)
+        is expected
+    )
+
+
 @pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="The DeepSeek V4 fast path is CUDA-only.",
 )
 @pytest.mark.parametrize(
-    ("num_tokens", "num_experts", "indices_type"),
+    "num_tokens,num_experts,topk,indices_type",
     [
-        (0, 256, torch.uint32),
-        (17, 256, torch.uint32),
-        (17, 384, torch.int64),
+        (0, 256, 6, torch.int32),
+        (17, 256, 6, torch.int32),
+        (17, 384, 6, torch.int64),
+        (17, 128, 3, torch.int32),
     ],
 )
-def test_dsv4_fast_topk(
-    num_tokens: int,
-    num_experts: int,
-    indices_type: torch.dtype,
+@pytest.mark.parametrize("use_padding", [False, True])
+def test_dsv4_routing_with_padding(
+    num_tokens,
+    num_experts,
+    topk,
+    indices_type,
+    use_padding,
+    monkeypatch,
+    default_vllm_config,
 ):
+    from vllm.forward_context import set_forward_context
+
+    monkeypatch.setenv("VLLM_MOE_SKIP_PADDING", "1")
     torch.manual_seed(0)
     gating_output = torch.randn(
         (num_tokens, num_experts), dtype=torch.float32, device="cuda"
     )
+    clean_logits = gating_output.clone()
     correction_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
+    weights_ref, ids_ref = _torch_topk_softplus_sqrt(
+        gating_output,
+        topk,
+        True,
+        1.5,
+        correction_bias,
+    )
+    is_padding = torch.arange(num_tokens, device="cuda") % 2 == 1
+    if use_padding:
+        gating_output[is_padding] = float("nan")
+    expected_weights, expected_ids = weights_ref.clone(), ids_ref.clone()
+    if use_padding:
+        expected_weights[is_padding] = 0
+        expected_ids[is_padding] = -1
 
-    topk_weights_ref, topk_ids_ref = _torch_topk_softplus_sqrt(
-        gating_output=gating_output,
-        topk=6,
-        renormalize=True,
-        routed_scaling_factor=1.5,
-        e_score_correction_bias=correction_bias,
-    )
-    topk_weights, topk_ids = dsv4_topk(
-        gating_output, correction_bias, indices_type, 1.5
-    )
+    def route():
+        with set_forward_context(
+            None,
+            default_vllm_config,
+            is_padding=is_padding if use_padding else None,
+        ):
+            return fused_topk_bias(
+                gating_output,
+                gating_output,
+                "sqrtsoftplus",
+                correction_bias,
+                topk,
+                True,
+                indices_type=indices_type,
+                routed_scaling_factor=1.5,
+            )
 
-    assert topk_ids.dtype == indices_type
-    torch.testing.assert_close(topk_ids_ref.to(indices_type), topk_ids, atol=0, rtol=0)
-    torch.testing.assert_close(
-        topk_weights_ref,
-        topk_weights,
-        atol=2e-5,
-        rtol=2e-5,
-    )
+    weights, ids = route()
+    assert ids.dtype == indices_type
+    torch.testing.assert_close(ids, expected_ids.to(indices_type), atol=0, rtol=0)
+    torch.testing.assert_close(weights, expected_weights, atol=2e-5, rtol=2e-5)
+    if use_padding and num_tokens:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            weights, ids = route()
+        is_padding.fill_(True)
+        graph.replay()
+        assert (ids == -1).all()
+        assert (weights == 0).all()
+        is_padding.fill_(False)
+        gating_output.copy_(clean_logits)
+        graph.replay()
+        torch.testing.assert_close(ids, ids_ref.to(indices_type), atol=0, rtol=0)
+        torch.testing.assert_close(weights, weights_ref, atol=2e-5, rtol=2e-5)
 
 
 @pytest.mark.skipif(
@@ -348,3 +407,111 @@ def test_fused_topk_softplus_sqrt_padding(
     sorted_w_ref = topk_weights_ref[rows_to_compare].gather(1, idx_ref)
     sorted_w = topk_weights[rows_to_compare].gather(1, idx_ops)
     torch.testing.assert_close(sorted_w_ref, sorted_w, atol=2e-2, rtol=1e-2)
+
+
+def _vision_routing_reference(
+    logits, bias, bias_vl, tokens, padding, topk, renormalize
+):
+    scores = F.softplus(logits.double()).sqrt().float()
+    image = (tokens >= 129264) & (tokens < 129269)
+    ids = (scores + torch.where(image[:, None], bias_vl, bias)).topk(topk).indices
+    weights = scores.gather(1, ids)
+    if renormalize:
+        weights /= weights.sum(-1, keepdim=True)
+    weights *= 1.5
+    return weights.masked_fill(padding[:, None], 0), ids.masked_fill(
+        padding[:, None], -1
+    )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("num_experts,topk", [(128, 3), (384, 6)])
+@pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("strided_bias", [False, True])
+def test_v41_vision_routing_bias_and_padding(
+    monkeypatch, device, num_experts, topk, renormalize, strided_bias
+):
+    """Image bias changes selection only; strided biases retain fallback semantics."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA execution unavailable")
+    from vllm.model_executor.layers.fused_moe.router import fused_topk_bias_router
+
+    logits = torch.linspace(-2, 2, 7 * num_experts, device=device).view(7, num_experts)
+    bias = torch.linspace(-1, 1, 2 * num_experts, device=device)[::2]
+    if not strided_bias:
+        bias = bias.contiguous()
+    bias_vl = -bias.contiguous()
+    tokens = torch.arange(129263, 129270, device=device)
+    padding = torch.tensor(
+        [False, False, True, False, False, False, True], device=device
+    )
+    logits[0] = -110.0
+    logits[1] = -18.0
+    logits[3] = -20.0
+    logits[4] = -15.0
+    logits[padding] = float("nan")
+    monkeypatch.setattr(fused_topk_bias_router, "_get_padding_mask", lambda _: padding)
+
+    actual = fused_topk_bias(
+        logits,
+        logits,
+        "sqrtsoftplus",
+        bias,
+        topk,
+        renormalize,
+        indices_type=torch.int64,
+        input_tokens=tokens,
+        routed_scaling_factor=1.5,
+        bias_vl=bias_vl,
+        image_sentinel_lo=129264,
+    )
+    expected = _vision_routing_reference(
+        logits, bias, bias_vl, tokens, padding, topk, renormalize
+    )
+    torch.testing.assert_close(actual[0], expected[0], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(actual[1], expected[1])
+    torch.testing.assert_close(
+        actual[0][~padding], expected[0][~padding], atol=0, rtol=1e-5
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph requires CUDA")
+@pytest.mark.parametrize("num_experts,topk", [(128, 3), (384, 6)])
+def test_v41_vision_routing_graph_replay(monkeypatch, num_experts, topk):
+    """Replay must read updated image IDs and padding instead of capture-time values."""
+    from vllm.model_executor.layers.fused_moe.router import fused_topk_bias_router
+
+    logits = torch.linspace(-2, 2, 7 * num_experts, device="cuda").view(7, num_experts)
+    bias = torch.linspace(-1, 1, num_experts, device="cuda")
+    bias_vl = -bias
+    tokens = torch.arange(129263, 129270, device="cuda")
+    padding = torch.zeros(7, dtype=torch.bool, device="cuda")
+    monkeypatch.setattr(fused_topk_bias_router, "_get_padding_mask", lambda _: padding)
+
+    def route():
+        return fused_topk_bias(
+            logits,
+            logits,
+            "sqrtsoftplus",
+            bias,
+            topk,
+            True,
+            input_tokens=tokens,
+            routed_scaling_factor=1.5,
+            bias_vl=bias_vl,
+            image_sentinel_lo=129264,
+        )
+
+    route()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        weights, ids = route()
+    for shift in (1, -2):
+        tokens.add_(shift)
+        padding.logical_not_()
+        graph.replay()
+        expected = _vision_routing_reference(
+            logits, bias, bias_vl, tokens, padding, topk, True
+        )
+        torch.testing.assert_close(weights, expected[0], atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(ids.long(), expected[1])

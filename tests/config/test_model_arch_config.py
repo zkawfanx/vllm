@@ -189,3 +189,18 @@ def test_draft_model_arch_config(
     _assert_model_config_methods(
         model_config, expected, check_head_size=check_head_size
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("vision_n_layers", [0, 2])
+def test_deepseek_v41_images_do_not_require_bidirectional_prefix(vision_n_layers):
+    """Causal image tokens must remain eligible for chunked multimodal input."""
+    from vllm.transformers_utils.configs.deepseek_v41 import DeepseekV41Config
+
+    config = DeepseekV41Config(
+        text_config={"sliding_window": 128},
+        vision_config={"num_hidden_layers": vision_n_layers, "max_image_tokens": 2048},
+    )
+    convertor = ModelArchConfigConvertorBase(config, config)
+    assert not convertor.is_mm_prefix_lm()
+    assert not getattr(config, "mm_prefix_clamp_sliding_window", False)

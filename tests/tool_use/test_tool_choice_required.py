@@ -5,12 +5,15 @@ from copy import deepcopy
 
 import pytest
 import regex as re
-from openai.types.responses import FunctionTool, WebSearchTool
+from openai.types.responses import FunctionTool, ToolChoiceFunction, WebSearchTool
 from pydantic import TypeAdapter
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedFunction,
+    ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
 )
+from vllm.exceptions import VLLMValidationError
 from vllm.tool_parsers.streaming import extract_required_tool_call_streaming
 from vllm.tool_parsers.utils import (
     find_tool_properties,
@@ -68,11 +71,18 @@ EXAMPLE_TOOLS = [
 
 
 def _compile_and_check(
-    tools: list[ChatCompletionToolsParam], sample_output, should_match: bool
+    tools: list[ChatCompletionToolsParam],
+    sample_output,
+    should_match: bool,
+    parallel_tool_calls: bool | None = None,
 ):
     # self = MagicMock(tool_choice="required", tools=tools)
     # schema = ChatCompletionRequest._get_json_schema_from_tool(self)
-    schema = get_json_schema_from_tools(tools=tools, tool_choice="required")
+    schema = get_json_schema_from_tools(
+        tools=tools,
+        tool_choice="required",
+        parallel_tool_calls=parallel_tool_calls,
+    )
     assert isinstance(schema, dict)
 
     # use build_regex_from_schema used in JSONLogitsProcessor to create Guide
@@ -394,3 +404,62 @@ class TestNonFunctionToolsSkipped:
         any_of = schema["items"]["anyOf"]
         assert len(any_of) == 1
         assert any_of[0]["properties"]["name"]["enum"] == ["get_weather"]
+
+    def test_get_json_schema_rejects_only_non_function_tools(self):
+        # An empty anyOf would compile to a grammar no output can satisfy.
+        with pytest.raises(VLLMValidationError, match="no function tool"):
+            get_json_schema_from_tools(tools=[WEB_SEARCH_TOOL], tool_choice="required")
+
+
+class TestParallelToolCallsConstraint:
+    """The decoding grammar limits calls before they consume output tokens."""
+
+    TOOLS = TypeAdapter(list[ChatCompletionToolsParam]).validate_python(EXAMPLE_TOOLS)
+    ONE_CALL = [{"name": "get_current_weather", "parameters": {"city": "Vienna"}}]
+    TWO_CALLS = [
+        {"name": "get_current_weather", "parameters": {"city": "Vienna"}},
+        {"name": "get_current_weather", "parameters": {"city": "Berlin"}},
+    ]
+
+    def test_disabled_rejects_a_second_tool_call(self):
+        _compile_and_check(self.TOOLS, self.ONE_CALL, True, parallel_tool_calls=False)
+        _compile_and_check(self.TOOLS, self.TWO_CALLS, False, parallel_tool_calls=False)
+
+    @pytest.mark.parametrize("parallel_tool_calls", [True, None])
+    def test_enabled_or_unset_still_allows_multiple(self, parallel_tool_calls):
+        _compile_and_check(
+            self.TOOLS,
+            self.TWO_CALLS,
+            True,
+            parallel_tool_calls=parallel_tool_calls,
+        )
+
+    @pytest.mark.parametrize("output,valid", [([], False), (ONE_CALL, True)])
+    def test_disabled_preserves_required_call_and_schema_defs(self, output, valid):
+        tool = self.TOOLS[0].model_copy(deep=True)
+        params = tool.function.parameters
+        params["$defs"] = {"City": {"type": "string"}}
+        params["properties"]["city"] = {"$ref": "#/$defs/City"}
+        _compile_and_check([tool], output, valid, parallel_tool_calls=False)
+
+    @pytest.mark.parametrize("api", ["chat", "responses"])
+    def test_forced_named_tool_is_unaffected(self, api):
+        # Named tool choice yields a bare parameters object, never an array.
+        tools = self.TOOLS
+        choice = ChatCompletionNamedToolChoiceParam(
+            function=ChatCompletionNamedFunction(name="get_current_weather")
+        )
+        if api == "responses":
+            tools = [
+                FunctionTool.model_validate(
+                    dict(tool.function.model_dump(), type="function")
+                )
+                for tool in tools
+            ]
+            choice = ToolChoiceFunction(type="function", name="get_current_weather")
+        schema = get_json_schema_from_tools(
+            tools=tools,
+            tool_choice=choice,
+            parallel_tool_calls=False,
+        )
+        assert schema == self.TOOLS[0].function.parameters

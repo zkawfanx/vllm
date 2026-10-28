@@ -109,6 +109,9 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
             num_hash_layers=0,
             image_sentinel_lo=IMAGE_SENTINEL_BASE_ID,
         )
+        if not self.use_mega_moe:
+            self.experts.router.bias_vl = self.gate.bias_vl
+            self.experts.router.image_sentinel_lo = self.image_sentinel_lo
 
 
 def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
@@ -183,6 +186,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         aux_stream_list: list[torch.cuda.Stream] | None = None,
         candidate_block_buffer: torch.Tensor | None = None,
         engram_layout: EngramLayout | None = None,
+        engram_prefetch_stream: torch.cuda.Stream | None = None,
     ):
         super().__init__()
 
@@ -201,6 +205,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     engram_layout.layer_ids.index(layer_id),
                     use_sequence_parallel=self.use_sequence_parallel,
                     prefix=f"{prefix}.engram",
+                    prefetch_stream=engram_prefetch_stream,
                 )
 
         self.rms_norm_eps = config.rms_norm_eps
@@ -333,6 +338,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 )
             else:
                 residual = x
+                if self.engram is not None and engram_hashes is not None:
+                    residual = self.engram(
+                        residual,
+                        engram_hashes[:, self.engram.layer_hash_index],
+                        engram_mask,
+                    )
                 post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                     residual,
                     self.hc_attn_fn,
@@ -461,6 +472,13 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
 
         self.engram_layout = EngramLayout.from_config(config)
+        engram_config = vllm_config.engram_config
+        engram_prefetch_stream = (
+            torch.cuda.Stream()
+            if self.engram_layout is not None
+            and (engram_config is None or engram_config.cpu_offload)
+            else None
+        )
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -471,6 +489,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 aux_stream_list=aux_stream_list,
                 candidate_block_buffer=self.candidate_block_buffer,
                 engram_layout=self.engram_layout,
+                engram_prefetch_stream=engram_prefetch_stream,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -608,7 +627,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
-                # Gather all Engram rows before entering the decoder layers.
+                # Schedule all Engram lookups before entering the decoder layers.
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
