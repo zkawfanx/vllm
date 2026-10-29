@@ -54,7 +54,8 @@ def test_expert_loader_initializes_all_local_replicas(
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
     model_module = import_module(f"vllm.models.{model_name}.nvidia.model")
-    monkeypatch.setattr(model_module, "get_tensor_model_parallel_rank", lambda: 0)
+    if hasattr(model_module, "get_tensor_model_parallel_rank"):
+        monkeypatch.setattr(model_module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(model_module, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(
         model_module,
