@@ -149,6 +149,8 @@ class ForwardContext:
     batch_descriptor: BatchDescriptor | None = None
 
     ubatch_slices: UBatchSlices | None = None
+    # Microbatches share step-wide output buffers, so retain their token origin.
+    ubatch_token_offset: int = 0
 
     # Boolean mask over the token axis: True for padding rows that are not real
     # tokens. Consumers can use it to skip work for padded tokens. None when
@@ -220,6 +222,7 @@ def create_forward_context(
     additional_kwargs: dict[str, Any] | None = None,
     skip_compiled: bool = False,
     is_padding: torch.Tensor | None = None,
+    ubatch_token_offset: int = 0,
 ):
     if vllm_config.compilation_config.fast_moe_cold_start:
         all_moe_layers = vllm_config.compilation_config.static_all_moe_layers
@@ -235,6 +238,7 @@ def create_forward_context(
         cudagraph_runtime_mode=cudagraph_runtime_mode,
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
+        ubatch_token_offset=ubatch_token_offset,
         skip_compiled=skip_compiled,
         additional_kwargs=additional_kwargs or {},
         is_padding=is_padding,
@@ -309,10 +313,8 @@ def set_forward_context(
             vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp
         )
 
-    # Convenience: if cudagraph is used and num_tokens is given, we can just
-    # create a batch descriptor here if not given (there's no harm since if it
-    # doesn't match in the wrapper it'll fall through).
-    if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
+    # Preserve the batch size before model-level sequence parallelism.
+    if num_tokens is not None:
         batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
     additional_kwargs = current_platform.set_additional_forward_context(

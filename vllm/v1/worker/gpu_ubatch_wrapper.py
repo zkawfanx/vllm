@@ -365,6 +365,7 @@ class UBatchWrapper:
                     attn_metadata[i] if attn_metadata is not None else None,
                     self.vllm_config,
                     dp_metadata=dp_metadata[i],
+                    ubatch_token_offset=ubatch_slice.token_slice.start,
                     batch_descriptor=batch_descriptor,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     slot_mapping=slot_mapping[i] if has_slot_mapping else None,
