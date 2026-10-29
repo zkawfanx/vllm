@@ -92,3 +92,54 @@ def test_stage_entry_injects_engram_before_mhc_pre(monkeypatch):
     mhc_residual, mhc_pre_mix = mhc_pre_calls[0]
     torch.testing.assert_close(mhc_residual, hidden + 10)
     assert mhc_pre_mix is pre_mix
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("owned_layer", [1, 14, None])
+def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
+    """PP placeholders skip remote Engrams before their TP weight loader runs."""
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+    from vllm.model_executor.models import utils
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    monkeypatch.setattr(utils, "_model_to_pp_missing_layer_names", {})
+    model_module = import_module("vllm.models.deepseek_v4_1.nvidia.model")
+    for module in (model_module, parameter):
+        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 1)
+        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+    model = model_module.DeepseekV4Model.__new__(model_module.DeepseekV4Model)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_attention_heads=2)
+    model.quant_config = None
+    model.use_sequence_parallel = False
+    model.get_expert_mapping = lambda: []
+    model.layers = torch.nn.ModuleList([PPMissingLayer() for _ in range(15)])
+    if owned_layer is not None:
+        layer = torch.nn.Module()
+        layer.engram = torch.nn.Module()
+        layer.engram.wkv = ColumnParallelLinear(
+            4,
+            8,
+            bias=False,
+            gather_output=True,
+            return_bias=False,
+            tp_rank=1,
+            tp_size=2,
+        )
+        model.layers[owned_layer] = layer
+    weights = {
+        f"layers.{index}.engram.wkv.weight": torch.arange(
+            32, dtype=torch.float32
+        ).reshape(8, 4)
+        + index
+        for index in (1, 14)
+    }
+    loaded = model.load_weights(weights.items())
+    if owned_layer is None:
+        assert not loaded
+    else:
+        name = f"layers.{owned_layer}.engram.wkv.weight"
+        assert loaded == {name}
+        torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
