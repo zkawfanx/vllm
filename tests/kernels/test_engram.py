@@ -12,6 +12,158 @@ from vllm.models.deepseek_v4_1.common.engram import Engram, ParallelEngramEmbedd
 from vllm.platforms import current_platform
 
 
+@pytest.fixture
+def make_engram_wkv(monkeypatch):
+    from vllm import distributed
+    from vllm.model_executor import parameter
+    from vllm.model_executor.layers import linear
+    from vllm.models.deepseek_v4_1.common import engram
+
+    state = SimpleNamespace(rank=0, size=1)
+    for module in (distributed, linear, parameter):
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_rank", lambda: state.rank
+        )
+        monkeypatch.setattr(
+            module, "get_tensor_model_parallel_world_size", lambda: state.size
+        )
+    monkeypatch.setattr(
+        engram,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(
+            engram_config=SimpleNamespace(cpu_offload=False),
+            scheduler_config=SimpleNamespace(max_num_batched_tokens=16),
+        ),
+    )
+    monkeypatch.setattr(
+        engram,
+        "ParallelEngramEmbedding",
+        lambda *a, **kw: SimpleNamespace(cpu_offload=False, part_n_hash_cols=2),
+    )
+
+    def make(rank, size, sp, quant_config=None):
+        state.rank, state.size = rank, size
+        return Engram(
+            SimpleNamespace(hidden_size=256, hc_mult=4, rms_norm_eps=1e-6),
+            quant_config,
+            SimpleNamespace(
+                num_embeddings=[64],
+                head_dim=32,
+                primes=[[[31, 37]]],
+                max_ngram_size=2,
+                n_heads=2,
+            ),
+            0,
+            use_sequence_parallel=sp,
+            prefix="model.layers.1.engram",
+        ).wkv
+
+    return make
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("tp_size,sp", [(1, False), (1, True), (8, False), (8, True)])
+def test_engram_wkv_preserves_output_order(make_engram_wkv, monkeypatch, tp_size, sp):
+    """Keep keys then value intact; SP owns padded token rows, not columns."""
+    from vllm.model_executor.layers import linear
+
+    weight = torch.arange(1280 * 64, dtype=torch.float32).reshape(1280, 64) % 17
+    inputs = torch.arange(9 * 64, dtype=torch.float32).reshape(9, 64) % 13
+    layers, local_inputs, partials = [], [], []
+    for rank in range(tp_size):
+        layer = make_engram_wkv(rank, tp_size, sp)
+        layer.weight.weight_loader(layer.weight, weight)
+        width = 1280 if sp else 1280 // tp_size
+        start = 0 if sp else rank * width
+        torch.testing.assert_close(layer.weight, weight[start : start + width])
+        rows = inputs
+        if sp:
+            chunk = (len(inputs) + tp_size - 1) // tp_size
+            rows = torch.nn.functional.pad(inputs, (0, 0, 0, (-len(inputs)) % tp_size))
+            rows = rows[rank * chunk : (rank + 1) * chunk]
+        layers.append(layer)
+        local_inputs.append(rows)
+        partials.append(torch.nn.functional.linear(rows, layer.weight))
+
+    gathered = torch.cat(partials, dim=-1) if not sp else None
+    calls: list[torch.Tensor] = []
+
+    def gather(partial):
+        torch.testing.assert_close(partial, partials[len(calls)])
+        calls.append(partial)
+        return gathered
+
+    monkeypatch.setattr(linear, "tensor_model_parallel_all_gather", gather)
+    for layer, rows in zip(layers, local_inputs):
+        result = layer(rows)
+        torch.testing.assert_close(result, torch.nn.functional.linear(rows, weight))
+        assert result.shape == (len(rows), 5 * 256)
+    assert len(calls) == (tp_size if tp_size > 1 and not sp else 0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("tp_size,sp", [(1, False), (1, True), (8, False), (8, True)])
+@pytest.mark.parametrize("expert_dtype", ["fp4", "fp8"])
+def test_engram_wkv_loads_matching_weight_and_scale_shards(
+    make_engram_wkv, monkeypatch, tp_size, sp, expert_dtype
+):
+    """Exercise real checkpoint loaders, without selecting or running a GPU kernel."""
+    from vllm.model_executor.layers.quantization import fp8, modelopt
+    from vllm.models.deepseek_v4_1.quant_config import DeepseekV4FP8Config
+
+    monkeypatch.setattr(
+        fp8,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+    )
+    monkeypatch.setattr(fp8, "cutlass_block_fp8_supported", lambda: False)
+    monkeypatch.setattr(fp8, "init_fp8_linear_kernel", lambda **kw: None)
+    monkeypatch.setattr(
+        modelopt,
+        "select_linear_kernel",
+        lambda *a, **kw: SimpleNamespace(input_quant_key=lambda: None),
+    )
+    config = DeepseekV4FP8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=[32, 32],
+    )
+    config.use_deep_gemm = False
+    config._resolved_expert_dtype = expert_dtype
+    weight = (torch.arange(1280 * 64).reshape(1280, 64) % 17).to(torch.float8_e4m3fn)
+    scale_bytes = (torch.arange(40 * 2).reshape(40, 2) % 15 + 120).to(torch.uint8)
+    scales = (
+        scale_bytes.view(torch.float8_e8m0fnu)
+        if expert_dtype == "fp4"
+        else scale_bytes.float()
+    )
+    expected_scales = (
+        scale_bytes.repeat_interleave(32, 0) if expert_dtype == "fp4" else scales
+    )
+    for rank in range(tp_size):
+        layer = make_engram_wkv(rank, tp_size, sp, config)
+        scale = layer.weight_scale if expert_dtype == "fp4" else layer.weight_scale_inv
+        layer.weight.weight_loader(layer.weight, weight)
+        scale.weight_loader(scale, scales)
+        effective_rank, size = (0, 1) if sp else (rank, tp_size)
+        width = len(weight) // size
+        torch.testing.assert_close(
+            layer.weight.view(torch.uint8),
+            weight[effective_rank * width : (effective_rank + 1) * width].view(
+                torch.uint8
+            ),
+        )
+        scale_width = len(expected_scales) // size
+        torch.testing.assert_close(
+            scale,
+            expected_scales[
+                effective_rank * scale_width : (effective_rank + 1) * scale_width
+            ],
+        )
+
+
 def _reference_lookup(weight, scale_inv, ids, start, end, block=32):
     """The torch expression the fused kernel replaces."""
     mask = (ids < start) | (ids >= end)
