@@ -2836,6 +2836,30 @@ def test_priority_scheduling_preemption():
     )
 
 
+def test_priority_self_preemption_keeps_scheduling_later_running_requests():
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=3, max_num_batched_tokens=64, num_blocks=5, block_size=16
+    )
+    requests = create_requests_with_priority(
+        num_requests=3, priorities=[0, 5, 0], num_tokens=16
+    )
+    # Admission order need not match priority order. Only one block remains;
+    # the first request consumes it, forcing the middle request to preempt itself.
+    for request in requests:
+        assert scheduler.kv_cache_manager.allocate_slots(request, 16) is not None
+        request.num_computed_tokens = 16
+        request.append_output_token_ids(100)
+        request.status = RequestStatus.RUNNING
+        scheduler.requests[request.request_id] = request
+        scheduler.running.append(request)
+
+    output = scheduler.schedule()
+
+    assert output.num_scheduled_tokens == {"0": 1, "2": 1}
+    assert requests[1].status == RequestStatus.PREEMPTED
+    assert [r.request_id for r in scheduler.running] == ["0", "2"]
+
+
 def test_priority_scheduling_no_preemption_when_space_available():
     """Test that preemption doesn't happen
     when there's space for new requests."""
