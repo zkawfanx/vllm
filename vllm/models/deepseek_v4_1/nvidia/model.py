@@ -1018,6 +1018,9 @@ class DeepseekV41LLMForCausalLM(
 ):
     model_cls = DeepseekV4Model
 
+    # Engram and token-dependent routing also run on later pipeline stages.
+    requires_raw_input_tokens = True
+
     # Default mapper assumes the original FP4-expert checkpoint layout.
     # Overridden per-instance in __init__ when expert_dtype != "fp4".
     hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper("fp4")
