@@ -231,3 +231,33 @@ def test_mistral_tokenizer_compile_grammar(
     grammar = backend.compile_grammar(request_type, grammar_spec)
     assert grammar is not None
     assert not grammar.is_terminated()
+
+
+@pytest.mark.parametrize("invalid", [[0, 2], [0, 3], [0, 3, 2]])
+def test_guidance_rejection_is_atomic_with_native_matcher(invalid):
+    import llguidance
+
+    from vllm.v1.structured_output.backend_guidance import GuidanceGrammar
+
+    class Tokenizer:
+        eos_token_id = 3
+        bos_token_id = None
+        tokens = [b"a", b"b", b"z", b"<eos>"]
+        special_token_ids = [3]
+
+        def __call__(self, text):
+            return [self.tokens.index(bytes([c])) for c in text]
+
+    tokenizer = llguidance.LLTokenizer(llguidance.TokenizerWrapper(Tokenizer()))
+    matcher = llguidance.LLMatcher(
+        tokenizer, llguidance.LLMatcher.grammar_from_regex("ab")
+    )
+    grammar = GuidanceGrammar(matcher, tokenizer, 4)
+    assert not grammar.accept_tokens("r", invalid)
+    assert not grammar.is_terminated()
+    assert grammar.accept_tokens("r", [0, 1])
+    assert grammar.accept_tokens("r", [3])
+    assert grammar.is_terminated()
+    grammar.rollback(3)
+    assert not grammar.is_terminated()
+    assert grammar.accept_tokens("r", [0, 1, 3])
