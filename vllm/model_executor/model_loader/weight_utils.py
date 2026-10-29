@@ -1116,6 +1116,7 @@ def instanttensor_weights_iterator(
     use_tqdm_on_load: bool,
     *,
     load_engram_on_cpu: bool = False,
+    local_expert_ids: set[int] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files
     using instanttensor library."""
@@ -1139,18 +1140,29 @@ def instanttensor_weights_iterator(
 
     gpu_weight_names: list[str] = []
     cpu_weights: dict[str, list[str]] = {}
-    if load_engram_on_cpu:
+    has_filterable_experts = False
+    empty_expert_ids: set[int] = set()
+    if load_engram_on_cpu or local_expert_ids is not None:
         for path in hf_weights_files:
             with safe_open(path, framework="pt") as metadata:
                 for name in metadata.keys():  # noqa: SIM118
                     # These tables can exceed device memory before TP sharding.
-                    if _ENGRAM_WEIGHT_RE.search(name) is not None:
+                    if (
+                        load_engram_on_cpu
+                        and _ENGRAM_WEIGHT_RE.search(name) is not None
+                    ):
                         cpu_weights.setdefault(path, []).append(name)
                     else:
-                        gpu_weight_names.append(name)
+                        # Collective eligibility must be identical on every rank.
+                        if local_expert_ids is not None and should_skip_weight(
+                            name, empty_expert_ids
+                        ):
+                            has_filterable_experts = True
+                        if not should_skip_weight(name, local_expert_ids):
+                            gpu_weight_names.append(name)
 
     extra_kwargs: dict[str, Any] = {}
-    if cpu_weights:
+    if cpu_weights or has_filterable_experts:
         # InstantTensor cannot combine selective I/O with collective loading.
         process_group = None
         extra_kwargs = {
@@ -1158,7 +1170,7 @@ def instanttensor_weights_iterator(
             "tensor_name_match_mode": "exact",
         }
 
-    if not cpu_weights or gpu_weight_names:
+    if not extra_kwargs or gpu_weight_names:
         device = current_platform.current_device()
 
         # copy=True yields tensors that own their memory, staying valid after the
