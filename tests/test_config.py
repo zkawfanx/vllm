@@ -1753,3 +1753,21 @@ def test_engram_rejects_overlapping_microbatches_before_offload_defaults(
     target.hf_text_config.engram_layer_ids = []
     VllmConfig._resolve_and_verify_engram_config(config)
     assert config.engram_config is None
+
+
+@pytest.mark.parametrize(
+    ("method", "uses_hidden_states", "drops_block"),
+    [
+        ("eagle", True, True),
+        ("eagle3", True, True),
+        ("mtp", True, True),
+        ("dflash", True, False),
+        ("dspark", True, False),
+        ("ngram", False, False),
+    ],
+)
+def test_speculative_block_drop_policy(method, uses_hidden_states, drops_block):
+    config = SpeculativeConfig(method="ngram", num_speculative_tokens=3)
+    config.method = method
+    assert config.use_eagle() is uses_hidden_states
+    assert config.needs_eagle_block_drop() is drops_block
