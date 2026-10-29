@@ -55,6 +55,10 @@ def kimi_vl_chat_template(content: str) -> str:
     )
 
 
+def deepseek_v41_chat_template(content: str) -> str:
+    return f"<｜begin▁of▁sentence｜><｜User｜>{content}<｜Assistant｜></think>"
+
+
 def step3_vl_chat_template(content: str) -> str:
     return (
         "<｜begin▁of▁sentence｜> You are a helpful assistant.<|BOT|>user\n "
@@ -184,6 +188,28 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
         needs_video_metadata=False,
         vllm_runner_kwargs={"trust_remote_code": True},
         marks=[pytest.mark.core_model],
+    ),
+    "deepseek_v41": VitCudagraphTestConfig(
+        model="deepseek-ai/DeepSeek-V4.1-Flash",
+        modalities=["image"],
+        image_prompt=deepseek_v41_chat_template(
+            "<｜deepseek_image｜>\n\nWhat is in this image?"
+        ),
+        compilation_config_overrides={
+            "encoder_cudagraph_token_budgets": [1024],
+        },
+        vllm_runner_kwargs={
+            "load_format": "dummy",
+            "attention_backend": "TRITON_MLA_SPARSE_DSV41",
+            # Ampere sparse decode requires packed 584-byte KV records.
+            "kv_cache_dtype": "fp8_ds_mla",
+            "mm_encoder_attn_backend": "FLASH_ATTN",
+            "hf_overrides": partial(
+                dummy_hf_overrides,
+                model_arch="DeepseekV41ForCausalLM",
+                exist_overrides={"vision_n_layers": 1},
+            ),
+        },
     ),
     "step3_vl": VitCudagraphTestConfig(
         model="stepfun-ai/Step3-VL-10B",

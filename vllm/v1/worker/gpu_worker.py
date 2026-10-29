@@ -510,9 +510,13 @@ class Worker(WorkerBase):
         # torch.cuda handle the live capture path already uses on ROCm.
         # XPU stays excluded (see #39977).
         cudagraph_memory_estimate = 0
-        if (
-            current_platform.is_cuda_alike()
-            and self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+        if current_platform.is_cuda_alike() and (
+            self.vllm_config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            or (
+                self.use_v2_model_runner
+                and self.vllm_config.compilation_config.cudagraph_mm_encoder
+                and not self.model_config.enforce_eager
+            )
         ):
             cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
 
