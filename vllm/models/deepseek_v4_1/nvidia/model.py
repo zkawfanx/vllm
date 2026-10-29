@@ -83,6 +83,32 @@ if typing.TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _index_expert_mapping(
+    mapping: list[tuple[str, str, int, str]],
+) -> dict[str, list[tuple[str, str, int, str]]]:
+    """Index logical checkpoint IDs, retaining ordered physical replicas."""
+    indexed: dict[str, list[tuple[str, str, int, str]]] = {}
+    for entry in mapping:
+        prefix, _, suffix = entry[1].partition(".")
+        expert_key, sep, _ = suffix.partition(".")
+        if prefix != "experts" or not expert_key.isdecimal() or not sep:
+            return {}
+        indexed.setdefault(expert_key, []).append(entry)
+    return indexed
+
+
+def _expert_mapping_candidates(
+    name: str,
+    mapping: list[tuple[str, str, int, str]],
+    indexed: dict[str, list[tuple[str, str, int, str]]],
+) -> list[tuple[str, str, int, str]]:
+    # Ambiguous paths and unsupported mappings retain substring matching semantics.
+    if name.count("experts.") == 1:
+        expert_key = name.partition("experts.")[2].partition(".")[0]
+        return indexed.get(expert_key, mapping)
+    return mapping
+
+
 class DeepseekV4MoE(DeepseekV4MoEBase):
     def __init__(
         self,
@@ -736,6 +762,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
+        indexed_expert_mapping = _index_expert_mapping(expert_mapping)
 
         # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
         # block count so the standard loaders below slice it evenly (trailing
@@ -785,7 +812,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         and loaded_weight.dtype == torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
+                    for mapping in _expert_mapping_candidates(
+                        name, expert_mapping, indexed_expert_mapping
+                    ):
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
                             continue

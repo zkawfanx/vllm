@@ -253,3 +253,52 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
         name = f"layers.{owned_layer}.engram.wkv.weight"
         assert loaded == {name}
         torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("redundant", [0, 6])
+@pytest.mark.parametrize("lora_prefix", ["", "base_layer."])
+def test_expert_mapping_index_preserves_checkpoint_matches(redundant, lora_prefix):
+    """Indexing must preserve shard order, replicas, scales and unusual paths."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.models.deepseek_v4_1.nvidia.model import (
+        _expert_mapping_candidates,
+        _index_expert_mapping,
+    )
+
+    mapping = RoutedExperts.build_expert_params_mapping(
+        "w1",
+        "w2",
+        "w3",
+        num_experts=16,
+        num_redundant_experts=redundant,
+        lora_base_layer_prefix=lora_prefix,
+    )
+    indexed = _index_expert_mapping(mapping)
+    assert len(indexed) == 16
+    for prefix in ("layers.0.ffn.", "model.layers.2.ffn.", "experts.0.child."):
+        for expert in ("0", "1", "10", "15", "01", "16"):
+            for proj in ("w1", "w2", "w3"):
+                for suffix in (
+                    "weight",
+                    "weight_scale",
+                    "weight_scale_inv",
+                    "input_scale",
+                ):
+                    name = f"{prefix}experts.{expert}.{proj}.{lora_prefix}{suffix}"
+                    candidates = _expert_mapping_candidates(name, mapping, indexed)
+                    assert [m for m in candidates if m[1] in name] == [
+                        m for m in mapping if m[1] in name
+                    ]
+    for unsupported in ("experts.w13", "experts.1", "1.w1.", ""):
+        unusual = mapping + [("missing", unsupported, 1, "w1")]
+        assert not _index_expert_mapping(unusual)
+        assert (
+            _expert_mapping_candidates(
+                "layers.0.ffn.experts.1.w1.weight",
+                unusual,
+                _index_expert_mapping(unusual),
+            )
+            is unusual
+        )
