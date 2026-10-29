@@ -15,6 +15,14 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
 
 
+@pytest.fixture(autouse=True)
+def single_rank_metadata(monkeypatch):
+    """Metadata-only builders do not initialize tensor-parallel groups."""
+    from vllm.v1.attention.backends.mla import indexer
+
+    monkeypatch.setattr(indexer.envs, "VLLM_INDEXER_QUERY_SHARD", False)
+
+
 def _make_indexer_test_config(
     max_model_len: int, max_num_batched_tokens: int = 8
 ) -> SimpleNamespace:
@@ -211,3 +219,32 @@ def test_indexer_decode_max_seq_len_matches_compressed_lengths(
     assert metadata.decode.max_seq_len == expected_compressed_max
     assert metadata.decode.seq_lens.item() == expected_compressed_len
     torch.testing.assert_close(seq_lens, original_seq_lens)
+
+
+@pytest.mark.parametrize(
+    "drafts,token_budget,expected_rows", [(0, 8192, 8), (5, 8192, 48), (5, 32, 32)]
+)
+def test_indexer_expanded_block_table_sized_by_decode_tokens(
+    monkeypatch, drafts, token_budget, expected_rows
+):
+    """Prefill capacity must not inflate persistent decode-only storage."""
+    from vllm.v1.attention.backends.mla import indexer
+
+    monkeypatch.setattr(indexer, "num_compute_units", lambda _: 1)
+    config = _make_indexer_test_config(1024, token_budget)
+    config.speculative_config = SimpleNamespace(num_speculative_tokens=drafts)
+    spec = MLAAttentionSpec(
+        block_size=256,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.bfloat16,
+        compress_ratio=4,
+    )
+    builder = DeepseekV32IndexerMetadataBuilder(
+        kv_cache_spec=spec,
+        layer_names=["dummy"],
+        vllm_config=config,
+        device=torch.device("cpu"),
+        block_table_width=4,
+    )
+    assert builder.expanded_block_table_buffer.shape == (expected_rows, 4)
