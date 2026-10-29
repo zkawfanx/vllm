@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
-from vllm.config import ModelConfig, SchedulerConfig, VllmConfig
+from vllm.config import ModelConfig, SchedulerConfig, SpeculativeConfig, VllmConfig
 from vllm.config.kv_events import KVEventsConfig
 from vllm.lora.request import LoRARequest
 from vllm.multimodal.inputs import (
@@ -3000,3 +3000,36 @@ def test_resolve_block_hashes_rejects_mismatched_view():
     mismatched = BlockHashListWithBlockSize(raw, 2, 8)
     with pytest.raises(AssertionError):
         resolve_block_hashes(mismatched, 2, 4)
+
+
+@pytest.mark.parametrize("method", ["eagle3", "mtp", "dflash", "dspark"])
+@pytest.mark.parametrize("with_ring", [False, True])
+def test_deepseek_draft_block_drop_annotation(method, with_ring):
+    """Both mixed-group paths must retain reusable hidden-state-only draft KV."""
+    config = _grouping_config()
+    config.speculative_config = SpeculativeConfig(
+        method="ngram", num_speculative_tokens=3
+    )
+    config.speculative_config.method = method
+    specs = {
+        "target.attn": new_mla_spec(block_size=64),
+        "target.swa": SlidingWindowMLASpec(
+            block_size=16,
+            num_kv_heads=1,
+            head_size=1024,
+            dtype=torch.float32,
+            sliding_window=128,
+            model_version="deepseek_v4",
+        ),
+    }
+    if with_ring:
+        specs["target.compressor"] = CircularBufferSpec(
+            block_size=8, num_kv_heads=1, head_size=1024, dtype=torch.float32
+        )
+    specs["draft.attn"] = new_swa_mla_spec(head_size=1024)
+    groups = get_kv_cache_groups(config, specs)
+    assert len(groups) >= 2
+    for group in groups:
+        assert group.is_eagle_group is (
+            method in ("eagle3", "mtp") and "draft.attn" in group.layer_names
+        )

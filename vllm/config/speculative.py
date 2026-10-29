@@ -1413,6 +1413,15 @@ class SpeculativeConfig:
         # TODO(ben): Refactor this so the naming is clearer
         return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
 
+    def needs_eagle_block_drop(self) -> bool:
+        """Whether draft KV at a position depends on the next token.
+
+        EAGLE/EAGLE3/MTP use the next token to build draft KV, so their
+        trailing prefix-cache block is volatile. DFlash/DSpark use only
+        target hidden states and can reuse that block.
+        """
+        return self.use_eagle() and not (self.use_dflash() or self.use_dspark())
+
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 

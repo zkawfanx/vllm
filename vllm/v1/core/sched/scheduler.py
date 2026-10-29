@@ -278,7 +278,10 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             max_in_flight_tokens=vllm_config.max_in_flight_tokens,
             enable_caching=self.cache_config.enable_prefix_caching,
-            use_eagle=self.use_eagle,
+            use_eagle=(
+                speculative_config is not None
+                and speculative_config.needs_eagle_block_drop()
+            ),
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
             dcp_world_size=self.dcp_world_size,
