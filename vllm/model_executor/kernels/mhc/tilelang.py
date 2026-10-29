@@ -196,13 +196,7 @@ def mhc_pre_delayed_tilelang(
         and the next FP32 pre-mix, with shapes (tokens, hc_mult, 1),
         (tokens, hc_mult, hc_mult), (tokens, hidden_size), and (tokens, hc_mult).
     """
-    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
-        mhc_pre_big_fuse_tilelang,
-    )
-    from vllm.model_executor.kernels.mhc.warmup import (
-        MHC_PRE_NORM_KERNEL,
-        compute_mhc_pre_num_splits,
-    )
+    from vllm.model_executor.kernels.mhc.warmup import compute_mhc_pre_num_splits
     from vllm.utils.deep_gemm import (
         is_deep_gemm_supported,
         tf32_hc_prenorm_gemm,
@@ -224,6 +218,78 @@ def mhc_pre_delayed_tilelang(
         assert pre_mix.shape == (num_tokens, hc_mult)
         assert pre_mix.dtype == torch.float32 and pre_mix.is_contiguous()
 
+    if num_tokens == 0:
+        return _mhc_pre_delayed_tilelang_fake(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix,
+            x,
+            norm_weight,
+            norm_eps,
+        )
+
+    use_deep_gemm = is_deep_gemm_supported()
+    n_splits = (
+        compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
+    )
+    mixes = torch.empty(
+        n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
+    )
+    sqrsum = torch.empty(
+        n_splits, num_tokens, dtype=torch.float32, device=residual.device
+    )
+    if use_deep_gemm:
+        tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
+    else:
+        _tilelang_hc_prenorm_gemm(x, fn, mixes, sqrsum, input_size, 1)
+    return _mhc_delayed_epilogue(
+        residual,
+        mixes,
+        sqrsum,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        pre_mix,
+        norm_weight,
+        norm_eps,
+        input_size,
+    )
+
+
+def _mhc_delayed_epilogue(
+    residual: torch.Tensor,
+    mixes: torch.Tensor,
+    sqrsum: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None,
+    norm_weight: torch.Tensor | None,
+    norm_eps: float,
+    input_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import (
+        mhc_pre_big_fuse_tilelang,
+    )
+    from vllm.model_executor.kernels.mhc.warmup import MHC_PRE_NORM_KERNEL
+
+    num_tokens, hc_mult, hidden_size = residual.shape
+    n_splits = mixes.shape[0]
     next_pre_mix = torch.empty(
         num_tokens, hc_mult, dtype=torch.float32, device=residual.device
     )
@@ -240,23 +306,9 @@ def mhc_pre_delayed_tilelang(
         layer_input,
         next_pre_mix,
     )
+
     if num_tokens == 0:
         return outputs
-
-    use_deep_gemm = is_deep_gemm_supported()
-    n_splits = (
-        compute_mhc_pre_num_splits(input_size, num_tokens) if use_deep_gemm else 1
-    )
-    mixes = torch.empty(
-        n_splits, num_tokens, mix_size, dtype=torch.float32, device=residual.device
-    )
-    sqrsum = torch.empty(
-        n_splits, num_tokens, dtype=torch.float32, device=residual.device
-    )
-    if use_deep_gemm:
-        tf32_hc_prenorm_gemm(x, fn, mixes, sqrsum, n_splits)
-    else:
-        _tilelang_hc_prenorm_gemm(x, fn, mixes, sqrsum, input_size, 1)
     if norm_weight is not None:
         assert norm_weight.shape == (hidden_size,)
         assert norm_weight.dtype == torch.bfloat16 and norm_weight.is_contiguous()
@@ -338,6 +390,168 @@ def _mhc_pre_delayed_tilelang_fake(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
         ),
         torch.empty(num_tokens, hc_mult, dtype=torch.float32, device=residual.device),
+    )
+
+
+def mhc_delayed_fused_config(
+    num_tokens: int, hidden_size: int, hc_mult: int
+) -> tuple[int, int, int] | None:
+    """Reuse the SM80 small-batch configuration without dropping partial tiles."""
+    if not 0 < num_tokens <= 16:
+        return None
+    mix_size = hc_mult * (hc_mult + 2)
+    tile_n, n_splits, n_thr = _SMALL_FMA_CONFIG
+    if mix_size % tile_n or hidden_size % (n_splits * n_thr):
+        tile_n = 2 if num_tokens < 8 else 3
+        n_splits = 8 if num_tokens < 8 and hidden_size <= 4096 else 4
+        n_thr = 256
+    if mix_size % tile_n or hidden_size % (n_splits * n_thr):
+        return None
+    return tile_n, n_splits, n_thr
+
+
+def mhc_fused_post_pre_delayed_tilelang(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse post mapping into the delayed projection for small, tiled batches.
+
+    The projection consumes the FP32 post result before residual BF16 rounding.
+    Larger or unsupported shapes retain the existing post/pre dispatch.
+    """
+    num_tokens, hc_mult, hidden_size = residual.shape
+    mix_size = hc_mult * (hc_mult + 2)
+    if num_tokens == 0:
+        return _mhc_fused_post_pre_delayed_tilelang_fake(
+            x,
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix,
+            norm_weight,
+            norm_eps,
+        )
+    config = mhc_delayed_fused_config(num_tokens, hidden_size, hc_mult)
+    if config is None:
+        residual = mhc_post_tilelang(x, residual, post_layer_mix, comb_res_mix)
+        return (
+            residual,
+            *mhc_pre_delayed_tilelang(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                pre_mix=pre_mix,
+                norm_weight=norm_weight,
+                norm_eps=norm_eps,
+            ),
+        )
+
+    from vllm.model_executor.kernels.mhc.tilelang_kernels import mhc_fused_tilelang
+
+    tile_n, n_splits, n_thr = config
+    mixes = torch.empty(
+        n_splits, num_tokens, mix_size, dtype=torch.float32, device=x.device
+    )
+    sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=x.device)
+    residual_out = torch.empty_like(residual)
+    mhc_fused_tilelang(
+        comb_res_mix,
+        residual,
+        post_layer_mix.view(num_tokens, hc_mult),
+        x,
+        fn.view(mix_size, hc_mult, hidden_size),
+        mixes,
+        sqrsum,
+        residual_out,
+        hc_mult,
+        hidden_size,
+        mix_size,
+        n_thr,
+        256,
+        tile_n,
+        n_splits,
+    )
+    return (
+        residual_out,
+        *_mhc_delayed_epilogue(
+            residual_out,
+            mixes,
+            sqrsum,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix,
+            norm_weight,
+            norm_eps,
+            hc_mult * hidden_size,
+        ),
+    )
+
+
+def _mhc_fused_post_pre_delayed_tilelang_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    pre_mix: torch.Tensor | None = None,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(residual),
+        *_mhc_pre_delayed_tilelang_fake(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            pre_mix=pre_mix,
+            norm_weight=norm_weight,
+            norm_eps=norm_eps,
+        ),
     )
 
 
@@ -1178,4 +1392,12 @@ direct_register_custom_op(
     op_func=hc_head_fused_kernel_tilelang,
     mutates_args=[],
     fake_impl=_hc_head_fused_kernel_tilelang_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="mhc_fused_post_pre_delayed_tilelang",
+    op_func=mhc_fused_post_pre_delayed_tilelang,
+    mutates_args=[],
+    fake_impl=_mhc_fused_post_pre_delayed_tilelang_fake,
 )
