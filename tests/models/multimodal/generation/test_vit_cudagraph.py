@@ -201,6 +201,8 @@ MODEL_CONFIGS: dict[str, VitCudagraphTestConfig] = {
         vllm_runner_kwargs={
             "load_format": "dummy",
             "attention_backend": "TRITON_MLA_SPARSE_DSV41",
+            # Ampere sparse decode requires packed 584-byte KV records.
+            "kv_cache_dtype": "fp8_ds_mla",
             "mm_encoder_attn_backend": "FLASH_ATTN",
             "hf_overrides": partial(
                 dummy_hf_overrides,
