@@ -467,6 +467,23 @@ class NgramHashState(nn.Module):
         self._kv_cache_ref = weakref.ref(kv_cache)
         return True
 
+    def dummy_hashes(
+        self, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Exercise Engram activations without reading table rows or hash history."""
+        num_tokens = input_ids.shape[0]
+        hashes = input_ids.new_full(
+            (
+                num_tokens,
+                len(self.layout.layer_ids),
+                (self.layout.max_ngram_size - 1) * self.layout.n_heads,
+            ),
+            DEAD_ID,
+            dtype=torch.int32,
+        )
+        keep = input_ids.new_zeros(num_tokens, dtype=torch.bool)
+        return hashes, keep
+
     def forward(
         self,
         input_ids: torch.Tensor,
