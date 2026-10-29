@@ -1416,7 +1416,11 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
   void* args[] = {&input,    &output_indices, &lengths,
                   &num_rows, &top_k_val,      &max_len};
 
-  const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
+  int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
+  const auto base = reinterpret_cast<uintptr_t>(input);
+  while (vec_size > 1 && base % (vec_size * sizeof(DType)) != 0) {
+    vec_size /= 2;
+  }
 
 #define DISPATCH_VEC_SIZE(VS)                                                 \
   if (vec_size == VS) {                                                       \
