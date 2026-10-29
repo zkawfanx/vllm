@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import array
 from collections.abc import Iterable, Sequence
 from functools import partial
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -9,6 +11,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import (
+    TORCH_DTYPE_TO_ARRAY_TYPECODE,
+    TORCH_DTYPE_TO_NUMPY_DTYPE,
     async_tensor_h2d,
     get_accelerator_view_from_cpu_tensor,
 )
@@ -16,6 +20,9 @@ from vllm.utils.torch_utils import (
 # Default round-robin depth for the UVA buffer pools. Must be >= the number of
 # concurrent in-flight steps (engine batch_queue_size).
 _DEFAULT_MAX_CONCURRENCY = 2
+
+_BUFFER_TYPES = (np.ndarray, array.array)
+_Chunk: TypeAlias = "np.ndarray | array.array[Any]"
 
 
 def set_default_max_concurrency(n: int) -> None:
@@ -194,7 +201,7 @@ class StagedWriteTensor:
     ):
         if max_concurrency is None:
             max_concurrency = _DEFAULT_MAX_CONCURRENCY
-        supported_dtypes = [torch.int32, torch.int64, torch.float32]
+        supported_dtypes = list(TORCH_DTYPE_TO_ARRAY_TYPECODE)
         if dtype not in supported_dtypes:
             raise ValueError(
                 f"Unsupported dtype {dtype}: should be one of {supported_dtypes}"
@@ -215,7 +222,10 @@ class StagedWriteTensor:
 
         self._staged_write_indices: list[int] = []
         self._staged_write_starts: list[int] = []
-        self._staged_write_contents: list[int | float] = []
+        self._typecode = TORCH_DTYPE_TO_ARRAY_TYPECODE[dtype]
+        self._staged_write_contents: array.array[Any] = array.array(self._typecode)
+        self._staged_write_chunks: list[_Chunk] = []
+        self._staged_write_len = 0
         self._staged_write_cu_lens: list[int] = []
 
         new_buffer = partial(UvaBufferPool, max_concurrency=max_concurrency)
@@ -227,21 +237,44 @@ class StagedWriteTensor:
     def stage_write(
         self, index: int, start: int, x: Iterable[int] | Iterable[float]
     ) -> None:
+        """Stage a row update; arrays must remain unchanged until apply_write.
+
+        NumPy and array.array inputs are retained by reference. Their values are
+        cast to the target dtype at apply time, including integer wraparound.
+        Other iterables are copied immediately.
+        """
         assert index >= 0
         assert start >= 0
-        if not x:
-            return
+        contents = self._staged_write_contents
+        if isinstance(x, _BUFFER_TYPES):
+            n = len(x)
+            if not n:
+                return
+            if contents:
+                self._staged_write_chunks.append(contents)
+                self._staged_write_contents = array.array(self._typecode)
+            self._staged_write_chunks.append(x)
+        else:
+            prev_len = len(contents)
+            if isinstance(x, list):
+                contents.fromlist(x)
+            else:
+                contents.extend(x)
+            n = len(contents) - prev_len
+            if not n:
+                return
+        self._staged_write_len += n
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(start)
-        self._staged_write_contents.extend(x)
-        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+        self._staged_write_cu_lens.append(self._staged_write_len)
 
     def stage_write_elem(self, index: int, x: int) -> None:
         assert index >= 0
+        self._staged_write_contents.append(x)
+        self._staged_write_len += 1
         self._staged_write_indices.append(index)
         self._staged_write_starts.append(0)
-        self._staged_write_contents.append(x)
-        self._staged_write_cu_lens.append(len(self._staged_write_contents))
+        self._staged_write_cu_lens.append(self._staged_write_len)
 
     def apply_write(self) -> None:
         n = len(self._staged_write_indices)
@@ -252,9 +285,8 @@ class StagedWriteTensor:
         starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
         cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
 
-        # Special handling for write_contents
         write_contents = async_tensor_h2d(
-            self._staged_write_contents, device=self.device, dtype=self.dtype
+            self._contents_numpy(), device=self.device, dtype=self.dtype
         )
 
         # Write diffs to the GPU buffer
@@ -275,8 +307,25 @@ class StagedWriteTensor:
     def clear_staged_writes(self) -> None:
         self._staged_write_indices.clear()
         self._staged_write_starts.clear()
-        self._staged_write_contents.clear()
+        # NumPy views can outlive staging, so do not resize an exported array.
+        self._staged_write_contents = array.array(self._typecode)
+        self._staged_write_chunks.clear()
+        self._staged_write_len = 0
         self._staged_write_cu_lens.clear()
+
+    def _staged_chunks(self) -> list[_Chunk]:
+        if not self._staged_write_contents:
+            return self._staged_write_chunks
+        return [*self._staged_write_chunks, self._staged_write_contents]
+
+    def _contents_numpy(self) -> np.ndarray:
+        chunks = self._staged_chunks()
+        dtype = TORCH_DTYPE_TO_NUMPY_DTYPE[self.dtype]
+        if not self._staged_write_chunks:
+            return np.asarray(self._staged_write_contents, dtype=dtype)
+        # A borrowed NumPy view may already be pinned: pin_memory() would not
+        # snapshot it before the asynchronous H2D transfer. Own the contents now.
+        return np.concatenate(chunks, dtype=dtype, casting="unsafe")
 
 
 class FusedStagedWriter:
@@ -304,7 +353,8 @@ class FusedStagedWriter:
         group_ids: list[int] = []
         indices: list[int] = []
         starts: list[int] = []
-        contents: list[int | float] = []
+        contents: list[_Chunk] = []
+        content_base = 0
         cu_lens: list[int] = []
 
         for group_id, t in enumerate(tensors):
@@ -315,9 +365,9 @@ class FusedStagedWriter:
             group_ids.extend([group_id] * n)
             indices.extend(t._staged_write_indices)
             starts.extend(t._staged_write_starts)
-            content_base = len(contents)
-            contents.extend(t._staged_write_contents)
+            contents.extend(t._staged_chunks())
             cu_lens.extend(content_base + cu_len for cu_len in t._staged_write_cu_lens)
+            content_base += t._staged_write_len
 
         if not group_ids:
             return
@@ -326,7 +376,10 @@ class FusedStagedWriter:
         indices_uva = self.indices.copy_to_uva(indices)
         starts_uva = self.starts.copy_to_uva(starts)
         cu_lens_uva = self.cu_lens.copy_to_uva(cu_lens)
-        contents_gpu = async_tensor_h2d(contents, device=self.device, dtype=torch.int32)
+        contents_np = np.concatenate(contents, dtype=np.int32, casting="unsafe")
+        contents_gpu = async_tensor_h2d(
+            contents_np, device=self.device, dtype=torch.int32
+        )
 
         _apply_write_kernel[(len(group_ids),)](
             output_ptrs,
