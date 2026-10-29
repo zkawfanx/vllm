@@ -9,17 +9,37 @@ and tolerated (token-embedding fallback) when it is not, while a miss within
 the processed range still fails loudly.
 """
 
+import weakref
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 
-from vllm.multimodal.inputs import MultiModalFeatureSpec, PlaceholderRange
+from vllm.multimodal.inputs import (
+    MultiModalFeatureSpec,
+    MultiModalFieldElem,
+    MultiModalKwargsItem,
+    MultiModalSharedField,
+    PlaceholderRange,
+)
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 
 pytestmark = pytest.mark.cpu_test
 
 HIDDEN = 4
+
+
+def _embeds_item(embeds: torch.Tensor) -> MultiModalKwargsItem:
+    """A `prompt_embeds` kwargs item, as the HF renderer builds it."""
+    return MultiModalKwargsItem(
+        {
+            "embedding": MultiModalFieldElem(
+                data=embeds, field=MultiModalSharedField(batch_size=1)
+            )
+        }
+    )
 
 
 def _feature(identifier: str, offset: int, length: int) -> MultiModalFeatureSpec:
@@ -397,3 +417,48 @@ def test_v2_runner_captures_encoder_after_decoder_and_counts_memory(
     ]
     runner.is_first_pp_rank = False
     assert runner.profile_cudagraph_memory() == 0
+
+
+def test_consumed_cpu_input_updates_are_request_local_and_replayable():
+    """Release one occurrence, keep layout/embeddings, then restore encode input."""
+    pixels = torch.ones(8, HIDDEN)
+    feature = replace(_feature("same", 0, 8), data=_embeds_item(pixels))
+    later = replace(feature, mm_position=PlaceholderRange(offset=16, length=8))
+    source = [feature, later]
+    cache = EncoderCache()
+    cache.add_request("a", source)
+    cache.add_request("b", source)
+    cache.encoder_outputs["same"] = torch.ones(8, HIDDEN)
+    cache.update_encoder_inputs("a", {0: None})
+    assert cache.mm_features["a"][0].data is None
+    assert cache.mm_features["a"][0].mm_position is feature.mm_position
+    assert cache.mm_features["a"][1].data is feature.data
+    assert cache.mm_features["b"][0].data is feature.data
+    assert source[0].data is not None
+    assert "same" in cache.encoder_outputs
+    cache.free_encoder_cache("same")
+    cache.update_encoder_inputs("a", {0: source[0].data})
+    runner = EncoderRunner(
+        model=torch.nn.Module(),
+        max_num_tokens=32,
+        hidden_size=HIDDEN,
+        encoder_cache=cache,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+    )
+    hashes, inputs = runner.prepare_mm_inputs({"a": [0]})
+    assert hashes == ["same"]
+    assert inputs == [(feature.modality, feature.data)]
+
+
+def test_consumed_cpu_input_releases_storage_before_request_finishes():
+    """The request may stay alive after its worker-owned storage is freed."""
+    cache = EncoderCache()
+    pixels = torch.ones(8, HIDDEN)
+    ref = weakref.ref(pixels)
+    cache.add_request("a", [replace(_feature("h", 0, 8), data=_embeds_item(pixels))])
+    del pixels
+    assert ref() is not None
+    cache.update_encoder_inputs("a", {0: None})
+    assert ref() is None
+    assert "a" in cache.mm_features
