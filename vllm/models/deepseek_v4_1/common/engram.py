@@ -676,7 +676,11 @@ class ParallelEngramEmbedding(nn.Module):
 
         # Explicit device: model init runs under a `torch.device("cuda")`
         # context, which would otherwise put the shard in HBM.
-        kwargs = {"device": "cpu", "pin_memory": True} if cpu_offload else {}
+        kwargs = (
+            {"device": "cpu", "pin_memory": True}
+            if cpu_offload and torch.get_default_device().type != "meta"
+            else {}
+        )
         self.weight = nn.Parameter(
             torch.empty(
                 self.part_num_embeddings, dim, dtype=torch.float8_e4m3fn, **kwargs
@@ -700,7 +704,7 @@ class ParallelEngramEmbedding(nn.Module):
                     "engram_vocab_start": self.vocab_start_idx,
                 },
             )
-        if cpu_offload:
+        if cpu_offload and not self.weight.is_meta:
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             set_weight_attrs(self.weight_scale_inv, {"dummy_weight_value": 127})
             logger.info(
