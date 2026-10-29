@@ -34,7 +34,7 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import is_cutedsl_supported
-from vllm.utils.math_utils import next_power_of_2
+from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.ops.fp8_sm80 import _decode_fp8_f32, _encode_fp8_u8
 
 
@@ -334,6 +334,20 @@ def _dequantize_and_gather_k_kernel(
             tl.store(output_row_ptr + bf16_output_offset + chunk_offsets, bf16_vals)
 
 
+# Keep enough independent token-load chains in flight to cover latency.
+_GATHER_STEPS_PER_WORKER = 8
+_GATHER_MIN_WORKERS = 128
+_GATHER_MAX_WORKERS = 8192
+
+
+def gather_num_workers(max_gather_len: int | None) -> int:
+    """Grid width for a gather of at most ``max_gather_len`` tokens."""
+    if max_gather_len is None:
+        return _GATHER_MIN_WORKERS
+    workers = cdiv(max_gather_len, _GATHER_STEPS_PER_WORKER)
+    return max(_GATHER_MIN_WORKERS, min(_GATHER_MAX_WORKERS, workers))
+
+
 def dequantize_and_gather_k_cache_triton(
     # [num_reqs, max_num_tokens, head_size]
     out: torch.Tensor,
@@ -348,6 +362,7 @@ def dequantize_and_gather_k_cache_triton(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    max_gather_len: int | None = None,
 ) -> None:
     TOKEN_FP8_DIM = 448
     TOKEN_BF16_DIM = 64
@@ -357,8 +372,8 @@ def dequantize_and_gather_k_cache_triton(
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
     num_reqs = seq_lens.shape[0]
-    NUM_WORKERS = 128
-    _dequantize_and_gather_k_kernel[(num_reqs, NUM_WORKERS)](
+    gather_workers = gather_num_workers(max_gather_len)
+    _dequantize_and_gather_k_kernel[(num_reqs, gather_workers)](
         out,
         out.stride(0),
         out.stride(1),
@@ -396,6 +411,7 @@ def dequantize_and_gather_k_cache(
     block_size: int,
     offset: int,
     use_fnuz: bool = False,
+    max_gather_len: int | None = None,
 ) -> None:
     """Dequantize and gather a paged DSv4 K cache.
 
@@ -403,6 +419,9 @@ def dequantize_and_gather_k_cache(
     ``False`` for ``compressed_k_cache`` (Triton encoder is OCP everywhere),
     ``current_platform.is_fp8_fnuz()`` for ``swa_k_cache`` (C++ encoder
     writes FNUZ on gfx942 and OCP on gfx950).
+
+    ``max_gather_len`` is a CPU-known bound used only to size the Triton grid,
+    not to limit the rows gathered.
     """
     if is_cutedsl_supported():
         # lazily import, otherwise some tests fail due to CUDA driver init failure.
@@ -424,6 +443,7 @@ def dequantize_and_gather_k_cache(
         block_size,
         offset,
         use_fnuz=use_fnuz,
+        max_gather_len=max_gather_len,
     )
 
 
