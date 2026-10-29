@@ -2222,6 +2222,37 @@ def _grouping_config():
     )
 
 
+@pytest.mark.parametrize(
+    ("cache_dtype", "dtype", "quant_mode"),
+    [
+        ("auto", torch.bfloat16, KVQuantMode.NONE),
+        ("fp8", torch.float8_e4m3fn, KVQuantMode.FP8_PER_TENSOR),
+        ("fp8_ds_mla", torch.uint8, KVQuantMode.FP8_PER_TENSOR),
+    ],
+)
+def test_unify_hybrid_mla_preserves_kv_quantization(cache_dtype, dtype, quant_mode):
+    common = dict(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=dtype,
+        cache_dtype_str=cache_dtype,
+        model_version="deepseek_v4",
+        kv_quant_mode=quant_mode,
+    )
+    full = MLAAttentionSpec(**common)
+    sliding = SlidingWindowMLASpec(**common, sliding_window=128)
+    specs = {"full": full, "sliding": sliding}
+
+    kv_cache_utils.unify_hybrid_kv_cache_specs(specs)
+
+    assert specs["full"] is full
+    assert isinstance(specs["sliding"], MLAAttentionSpec)
+    assert specs["sliding"].kv_quant_mode == quant_mode
+    assert specs["sliding"].cache_dtype_str == cache_dtype
+    assert specs["sliding"].page_size_bytes == sliding.page_size_bytes
+
+
 def test_mla_draft_prefers_standard_layout_when_pages_can_be_unified():
     specs = {
         "target.0.attn": new_mla_spec(),
