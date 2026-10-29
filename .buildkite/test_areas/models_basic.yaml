@@ -39,8 +39,9 @@ steps:
   - tests/models/transformers/test_backend.py
   - tests/models/test_registry.py
   - tests/models/test_deepseek_v41_pipeline.py
+  - tests/models/test_deepseek_v41_stream_weights.py
   commands:
-    - pytest -v -s models/test_terratorch.py models/transformers/test_backend.py models/test_registry.py models/test_deepseek_v41_pipeline.py
+    - pytest -v -s models/test_terratorch.py models/transformers/test_backend.py models/test_registry.py models/test_deepseek_v41_pipeline.py models/test_deepseek_v41_stream_weights.py
   mirror:
     amd:
       dind: false
