@@ -83,10 +83,13 @@ void launch_persistent_topk(const torch::stable::Tensor& logits,
     uint32_t max_chunk_elements =
         static_cast<uint32_t>(available_for_ordered / sizeof(uint32_t));
 
+    // Sliced views can shift the base without changing the row stride.
+    const auto base =
+        reinterpret_cast<uintptr_t>(logits.const_data_ptr<float>());
     uint32_t vec_size = 1;
-    if (stride % 4 == 0)
+    if (stride % 4 == 0 && base % 16 == 0)
       vec_size = 4;
-    else if (stride % 2 == 0)
+    else if (stride % 2 == 0 && base % 8 == 0)
       vec_size = 2;
 
     max_chunk_elements = (max_chunk_elements / vec_size) * vec_size;

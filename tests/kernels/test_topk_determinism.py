@@ -110,6 +110,24 @@ def test_topk_deterministic_and_exact(kernel: str, scenario: str, n: int):
 
 
 @requires_cuda
+@pytest.mark.parametrize("rows,n", [(1, 8192), (2, 65536), (33, 65536)])
+@pytest.mark.parametrize("offset", [0, 1, 2])
+@torch.inference_mode()
+def test_persistent_topk_shifted_base(rows: int, n: int, offset: int):
+    """Both dispatch routes must respect base alignment, not just row stride."""
+    storage = torch.empty(rows * n + offset, device="cuda")
+    logits = storage[offset:].view(rows, n)
+    logits.copy_(_make_logits("unique", n))
+    lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
+
+    first = _run_persistent(logits, lengths, K, n)
+    expected = _reference_set(logits[0], K)
+    for row in first.tolist():
+        assert frozenset(row) == expected
+    assert torch.equal(first, _run_persistent(logits, lengths, K, n))
+
+
+@requires_cuda
 @torch.inference_mode()
 def test_persistent_topk_mixed_lengths_batch():
     """Short rows interleaved with multi-CTA rows in one batch.
