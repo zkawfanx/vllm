@@ -54,6 +54,35 @@ def test_language_model_only_affects_model_hash():
     assert base_hash != lm_only_hash
 
 
+@pytest.mark.parametrize(
+    "baseline_kwargs,mm_kwargs",
+    [
+        ({}, {"limit_mm_per_prompt": {"image": 0}}),
+        ({}, {"limit_mm_per_prompt": {"image": {"count": 0}}}),
+        (
+            {"limit_mm_per_prompt": {"image": 0}},
+            {"limit_mm_per_prompt": {"image": 0}, "enable_mm_embeds": True},
+        ),
+    ],
+)
+def test_multimodal_input_mode_affects_model_hash(baseline_kwargs, mm_kwargs):
+    """Text-only and embedding inputs must not share compiled LM artifacts."""
+    model = "llava-hf/llava-1.5-7b-hf"
+    assert (
+        ModelConfig(model, **baseline_kwargs).compute_hash()
+        != ModelConfig(model, **mm_kwargs).compute_hash()
+    )
+
+
+def test_multimodal_dummy_dimensions_do_not_affect_model_hash():
+    model = "llava-hf/llava-1.5-7b-hf"
+    base = ModelConfig(model, limit_mm_per_prompt={"image": 1})
+    resized = ModelConfig(
+        model, limit_mm_per_prompt={"image": {"count": 1, "width": 224}}
+    )
+    assert base.compute_hash() == resized.compute_hash()
+
+
 @pytest.mark.parametrize("backend_arg", ["video_backend", "backend"])
 def test_use_gpu_video_backend_from_media_io_kwargs(backend_arg: str):
     config = MultiModalConfig(
