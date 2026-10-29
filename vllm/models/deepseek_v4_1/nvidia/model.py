@@ -784,9 +784,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
                         param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
+                        # One logical expert can have multiple local replicas.
                         weight_loader = typing.cast(
                             Callable[..., bool], param.weight_loader
                         )
@@ -799,9 +797,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             return_success=True,
                         )
                         if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
+                            loaded_params.add(name_mapped)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
@@ -862,6 +858,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
+            num_redundant_experts=first_layer.ffn.n_redundant_experts,
         )
 
     def finalize_mega_moe_weights(self) -> None:
