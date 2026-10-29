@@ -157,19 +157,12 @@ class XgrammarGrammar(StructuredOutputGrammar):
         """
         if self._is_terminated:
             return False
-        for token in tokens:
+        for num_accepted, token in enumerate(tokens):
             if not self.matcher.accept_token(token):
-                # Expected under spec decode when reasoning ends mid-window:
-                # drafts made before the grammar engaged may be invalid and
-                # the caller tolerates the rejection (structured_output
-                # advance loop). The FATAL variant is logged by the scheduler
-                # ("Unexpected: grammar rejected tokens ... Terminating"), so
-                # this stays quiet.
-                logger.debug(
-                    "FSM did not advance for request %s on token %s.",
-                    request_id,
-                    token,
-                )
+                if num_accepted:
+                    self.matcher.rollback(num_accepted)
+                    self.num_processed_tokens -= num_accepted
+                self._is_terminated = self.matcher.is_terminated()
                 return False
             self.num_processed_tokens += 1
         self._is_terminated = self.matcher.is_terminated()
