@@ -41,7 +41,9 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
     def dispatch(self, *, n_splits, **fields) -> CompileKey:  # type: ignore[override]
         return self.CompileKey(n_splits=n_splits, **fields)
 
-    def get_warmup_keys(self, *, max_tokens: int, **fields) -> list[CompileKey]:
+    def get_warmup_keys(
+        self, *, max_tokens: int, extra_splits: tuple[int, ...] = (), **fields
+    ) -> list[CompileKey]:
         # The split heuristic changes only at 64-token boundaries.
         splits = (
             sorted(
@@ -53,7 +55,9 @@ class MHCPreNormKernel(VllmJitKernel["MHCPreNormKernel.CompileKey"]):
             if is_deep_gemm_supported()
             else [1]
         )
-        return self._trace_dispatch(self.dispatch)(n_splits=splits, **fields)
+        return self._trace_dispatch(self.dispatch)(
+            n_splits=sorted(set(splits).union(extra_splits)), **fields
+        )
 
     def compile(self, compile_key: CompileKey) -> None:
         if compile_key not in self._compiled_cache:

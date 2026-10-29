@@ -143,3 +143,76 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
         name = f"layers.{owned_layer}.engram.wkv.weight"
         assert loaded == {name}
         torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("with_engram", [False, True])
+def test_delayed_fusion_preserves_engram_boundary_and_mix_carry(
+    monkeypatch, with_engram
+):
+    module = import_module("vllm.models.deepseek_v4_1.nvidia.model")
+    events = []
+    carried = torch.tensor([1.0])
+    attention_pre = torch.tensor([2.0])
+    ffn_pre = torch.tensor([3.0])
+    residual = torch.zeros(1, 4, 2)
+    x = torch.ones(1, 2)
+
+    def post(x, residual, *mixes):
+        events.append("post")
+        return residual + 10
+
+    def pre(residual, fn, *args, pre_mix, **kwargs):
+        events.append(("pre", fn))
+        assert pre_mix is carried
+        torch.testing.assert_close(residual, torch.full_like(residual, 30))
+        return None, None, x, attention_pre
+
+    def fused(x, residual, post_mix, res_mix, fn, *args, pre_mix, **kwargs):
+        events.append(("fused", fn))
+        assert pre_mix is (carried if fn == "attn" else attention_pre)
+        return residual + 10, None, None, x, attention_pre if fn == "attn" else ffn_pre
+
+    class Engram:
+        layer_hash_index = 0
+
+        def __call__(self, residual, hashes, mask):
+            events.append("engram")
+            return residual + 20
+
+    layer = SimpleNamespace(
+        engram=Engram() if with_engram else None,
+        hc_attn_fn="attn",
+        hc_ffn_fn="ffn",
+        hc_attn_scale=None,
+        hc_ffn_scale=None,
+        hc_attn_base=None,
+        hc_ffn_base=None,
+        rms_norm_eps=1e-6,
+        hc_eps=1e-6,
+        hc_post_alpha=2,
+        hc_sinkhorn_iters=20,
+        attn_norm=SimpleNamespace(weight=None, variance_epsilon=1e-6),
+        ffn_norm=SimpleNamespace(weight=None, variance_epsilon=1e-6),
+        use_sequence_parallel=False,
+        attn=lambda positions, x, _: x,
+        ffn=lambda x, ids: x,
+    )
+    monkeypatch.setattr(module, "mhc_post_tilelang", post)
+    monkeypatch.setattr(module, "mhc_pre_delayed_tilelang", pre)
+    monkeypatch.setattr(module, "mhc_fused_post_pre_delayed_tilelang", fused)
+    result = module.DeepseekV4DecoderLayer.forward(
+        layer,
+        x,
+        torch.zeros(1),
+        None,
+        pre_mix=carried,
+        residual=residual,
+        engram_hashes=torch.zeros(1, 1),
+    )
+    assert len(result) == 5 and result[-1] is ffn_pre
+    expected = (
+        ["post", "engram", ("pre", "attn")] if with_engram else [("fused", "attn")]
+    )
+    assert events == [*expected, ("fused", "ffn")]

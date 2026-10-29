@@ -19,6 +19,8 @@ from vllm.distributed import (
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
+    mhc_delayed_fused_config,
+    mhc_fused_post_pre_delayed_tilelang,
     mhc_post_tilelang,
     mhc_pre_delayed_tilelang,
 )
@@ -237,6 +239,18 @@ class DeepseekV4DecoderLayer(nn.Module):
             if self.use_sequence_parallel:
                 tp_size = vllm_config.parallel_config.tensor_parallel_size
                 max_tokens = (max_tokens + tp_size - 1) // tp_size
+            fused_splits = tuple(
+                {
+                    fused_config[1]
+                    for tokens in (1, 8)
+                    if (
+                        fused_config := mhc_delayed_fused_config(
+                            tokens, self.hidden_size, self.hc_mult
+                        )
+                    )
+                    is not None
+                }
+            )
             for input_size, use_pre_mix in (
                 (self.hidden_size, False),
                 (self.hc_mult * self.hidden_size, False),
@@ -254,6 +268,9 @@ class DeepseekV4DecoderLayer(nn.Module):
                     hc_mult=self.hc_mult,
                     use_pre_mix_in=use_pre_mix,
                     rms_numel=input_size,
+                    extra_splits=fused_splits
+                    if input_size == self.hc_mult * self.hidden_size
+                    else (),
                 )
         mix_hc = (2 + self.hc_mult) * self.hc_mult
         hc_dim = self.hc_mult * self.hidden_size
@@ -358,17 +375,16 @@ class DeepseekV4DecoderLayer(nn.Module):
                     norm_weight=self.attn_norm.weight,
                     norm_eps=self.attn_norm.variance_epsilon,
                 )
-        else:
+        elif self.engram is not None and engram_hashes is not None:
             residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
-            if self.engram is not None and engram_hashes is not None:
-                # Engram injection happens between the previous sublayer's
-                # post and this block's pre, on the full hc stream, so the
-                # mix coefficients see the injected stream.
-                residual = self.engram(
-                    residual,
-                    engram_hashes[:, self.engram.layer_hash_index],
-                    engram_mask,
-                )
+            # Engram injection happens between the previous sublayer's
+            # post and this block's pre, on the full hc stream, so the
+            # mix coefficients see the injected stream.
+            residual = self.engram(
+                residual,
+                engram_hashes[:, self.engram.layer_hash_index],
+                engram_mask,
+            )
             post_mix, res_mix, x, attn_pre = mhc_pre_delayed_tilelang(
                 residual,
                 self.hc_attn_fn,
@@ -384,6 +400,27 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=self.attn_norm.variance_epsilon,
             )
 
+        else:
+            residual, post_mix, res_mix, x, attn_pre = (
+                mhc_fused_post_pre_delayed_tilelang(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.rms_norm_eps,
+                    self.hc_eps,
+                    self.hc_eps,
+                    self.hc_post_alpha,
+                    self.hc_sinkhorn_iters,
+                    pre_mix=pre_mix,
+                    norm_weight=self.attn_norm.weight,
+                    norm_eps=self.attn_norm.variance_epsilon,
+                )
+            )
+
         if self.use_sequence_parallel:
             x = sp_all_gather(x)[: positions.shape[0]]
 
@@ -391,9 +428,11 @@ class DeepseekV4DecoderLayer(nn.Module):
         if self.use_sequence_parallel:
             x = sp_reduce_scatter(x)
 
-        residual = mhc_post_tilelang(x, residual, post_mix, res_mix)
-        post_mix, res_mix, x, ffn_pre = mhc_pre_delayed_tilelang(
+        residual, post_mix, res_mix, x, ffn_pre = mhc_fused_post_pre_delayed_tilelang(
+            x,
             residual,
+            post_mix,
+            res_mix,
             self.hc_ffn_fn,
             self.hc_ffn_scale,
             self.hc_ffn_base,

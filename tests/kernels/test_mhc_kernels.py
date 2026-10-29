@@ -690,3 +690,178 @@ def test_hc_collapse_before_gather_is_bitwise_equal(num_tokens, tp_size):
     )[:num_tokens]
     assert after.shape == (num_tokens, 5120)
     torch.testing.assert_close(after, before, atol=0, rtol=0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("tokens", [0, 1, 6, 8, 16, 17, 32])
+@pytest.mark.parametrize("hidden", [2048, 4096, 5120, 7168, 5136])
+def test_delayed_fusion_dispatch_covers_only_complete_tiles(tokens, hidden):
+    from vllm.model_executor.kernels.mhc.tilelang import mhc_delayed_fused_config
+
+    config = mhc_delayed_fused_config(tokens, hidden, 4)
+    if not 0 < tokens <= 16 or hidden == 5136:
+        assert config is None
+    else:
+        assert config is not None
+        tile, splits, threads = config
+        assert 24 % tile == 0
+        assert hidden % (splits * threads) == 0
+
+
+@pytest.mark.skipif(not HAS_TILELANG_MHC, reason="TileLang MHC support required")
+@pytest.mark.parametrize("tokens", [0, 1, 6, 8, 16, 17, 128])
+@pytest.mark.parametrize("hidden", [4096, 5120, 7168])
+@pytest.mark.parametrize("carried", [False, True])
+@pytest.mark.parametrize("normalized", [False, True])
+def test_delayed_fusion_matches_projection_reference(
+    tokens, hidden, carried, normalized
+):
+    from vllm.model_executor.kernels.mhc.tilelang import (
+        mhc_delayed_fused_config,
+        mhc_fused_post_pre_delayed_tilelang,
+        mhc_post_tilelang,
+        mhc_pre_delayed_tilelang,
+    )
+
+    set_random_seed(0)
+    residual = torch.randn(tokens, 4, hidden, device=DEVICE, dtype=torch.bfloat16)
+    x = torch.randn(tokens, hidden, device=DEVICE, dtype=torch.bfloat16)
+    previous_post = torch.rand(tokens, 4, 1, device=DEVICE)
+    previous_comb = torch.rand(tokens, 4, 4, device=DEVICE)
+    fn = torch.randn(24, 4 * hidden, device=DEVICE) * 0.02
+    scale = torch.tensor([0.5, 0.25, 1.0], device=DEVICE)
+    base = torch.randn(24, device=DEVICE)
+    pre = torch.rand(tokens, 4, device=DEVICE) if carried else None
+    norm = (
+        torch.ones(hidden, device=DEVICE, dtype=torch.bfloat16) if normalized else None
+    )
+    args = (
+        x,
+        residual,
+        previous_post,
+        previous_comb,
+        fn,
+        scale,
+        base,
+        1e-20,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        pre,
+        norm,
+        1e-6,
+    )
+    actual = mhc_fused_post_pre_delayed_tilelang(*args)
+    assert [v.shape for v in actual] == [
+        (tokens, 4, hidden),
+        (tokens, 4, 1),
+        (tokens, 4, 4),
+        (tokens, hidden),
+        (tokens, 4),
+    ]
+    if not tokens:
+        return
+    post = mhc_post_tilelang(x, residual, previous_post, previous_comb)
+    reference = mhc_pre_delayed_tilelang(
+        post,
+        fn,
+        scale,
+        base,
+        1e-20,
+        1e-6,
+        1e-6,
+        2.0,
+        20,
+        pre_mix=pre,
+        norm_weight=norm,
+    )
+    torch.testing.assert_close(actual[0], post, atol=0, rtol=0)
+    torch.testing.assert_close(actual[3], reference[2], atol=0, rtol=0)
+    if mhc_delayed_fused_config(tokens, hidden, 4) is None:
+        for value, expected in zip(actual[1:], reference, strict=True):
+            torch.testing.assert_close(value, expected, atol=0, rtol=0)
+    else:
+        # Fused projection uses the unrounded post, not its stored BF16 value.
+        post_float = torch.einsum("tij,tih->tjh", previous_comb, residual.float())
+        post_float += previous_post * x.float().unsqueeze(1)
+        flat = post_float.flatten(1)
+        mixes = (flat @ fn.T) * (flat.square().mean(-1, keepdim=True) + 1e-20).rsqrt()
+        coefficients = (
+            mixes
+            * torch.cat((scale[0].expand(4), scale[1].expand(4), scale[2].expand(16)))
+            + base
+        )
+        expected = (
+            coefficients[:, 4:8].sigmoid().unsqueeze(-1) * 2,
+            sinkhorn_normalize_ref(coefficients[:, 8:].view(tokens, 4, 4), 20, 1e-6),
+            coefficients[:, :4].sigmoid() + 1e-6,
+        )
+        for index, value in zip((1, 2, 4), expected, strict=True):
+            torch.testing.assert_close(actual[index], value, atol=1e-5, rtol=1e-4)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mhc_fused_post_pre_delayed_tilelang(*args)
+    graph.replay()
+    for value, expected in zip(captured, actual, strict=True):
+        torch.testing.assert_close(value, expected, atol=0, rtol=0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("tokens,hidden", [(0, 5120), (17, 5120), (1, 5136)])
+def test_delayed_fusion_fallback_and_empty(monkeypatch, tokens, hidden):
+    from vllm.model_executor.kernels.mhc import tilelang as module
+
+    residual = torch.empty(tokens, 4, hidden, dtype=torch.bfloat16)
+    x = torch.empty(tokens, hidden, dtype=torch.bfloat16)
+    events = []
+
+    def post(*args):
+        events.append("post")
+        return residual
+
+    def pre(*args, **kwargs):
+        events.append("pre")
+        return ("post", "comb", "input", "next")
+
+    monkeypatch.setattr(module, "mhc_post_tilelang", post)
+    monkeypatch.setattr(module, "mhc_pre_delayed_tilelang", pre)
+    out = module.mhc_fused_post_pre_delayed_tilelang(
+        x, residual, None, None, None, None, None, 1e-6, 1e-6, 1e-6, 2.0, 20
+    )
+    assert len(out) == 5
+    assert events == (["post", "pre"] if tokens else [])
+    if not tokens:
+        assert [t.shape for t in out] == [
+            (0, 4, hidden),
+            (0, 4, 1),
+            (0, 4, 4),
+            (0, hidden),
+            (0, 4),
+        ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+def test_delayed_fusion_warmup_includes_fused_splits(monkeypatch):
+    from vllm.model_executor.kernels.mhc import warmup
+
+    monkeypatch.setattr(warmup, "is_deep_gemm_supported", lambda: False)
+    keys = warmup.MHC_PRE_NORM_KERNEL.get_warmup_keys(
+        max_tokens=128,
+        extra_splits=(4, 16, 4),
+        hidden_size=5120,
+        rms_eps=1e-6,
+        hc_pre_eps=1e-6,
+        hc_sinkhorn_eps=1e-6,
+        hc_post_mult_value=2.0,
+        sinkhorn_repeat=20,
+        norm_eps=1e-6,
+        hc_mult=4,
+        use_pre_mix_in=True,
+        rms_numel=20480,
+    )
+    assert sorted(key.n_splits for key in keys) == [1, 4, 16]
+    assert all(key.rms_numel == 20480 for key in keys)
