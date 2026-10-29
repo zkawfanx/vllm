@@ -106,9 +106,8 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
 
     monkeypatch.setattr(utils, "_model_to_pp_missing_layer_names", {})
     model_module = import_module("vllm.models.deepseek_v4_1.nvidia.model")
-    for module in (model_module, parameter):
-        monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 1)
-        monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 2)
     model = model_module.DeepseekV4Model.__new__(model_module.DeepseekV4Model)
     torch.nn.Module.__init__(model)
     model.config = SimpleNamespace(num_attention_heads=2)
