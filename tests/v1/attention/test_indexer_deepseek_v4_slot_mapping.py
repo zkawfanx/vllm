@@ -15,6 +15,14 @@ from vllm.v1.kv_cache_interface import MLAAttentionSpec
 from vllm.v1.worker.block_table import get_block_table_width
 
 
+@pytest.fixture(autouse=True)
+def single_rank_metadata(monkeypatch):
+    """Metadata-only builders do not initialize tensor-parallel groups."""
+    from vllm.v1.attention.backends.mla import indexer
+
+    monkeypatch.setattr(indexer.envs, "VLLM_INDEXER_QUERY_SHARD", False)
+
+
 def _make_indexer_test_config(
     max_model_len: int, max_num_batched_tokens: int = 8
 ) -> SimpleNamespace:
@@ -222,7 +230,6 @@ def test_indexer_expanded_block_table_sized_by_decode_tokens(
     """Prefill capacity must not inflate persistent decode-only storage."""
     from vllm.v1.attention.backends.mla import indexer
 
-    monkeypatch.setattr(indexer.envs, "VLLM_INDEXER_QUERY_SHARD", False)
     monkeypatch.setattr(indexer, "num_compute_units", lambda _: 1)
     config = _make_indexer_test_config(1024, token_budget)
     config.speculative_config = SimpleNamespace(num_speculative_tokens=drafts)
