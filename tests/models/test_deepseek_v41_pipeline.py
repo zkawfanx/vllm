@@ -143,3 +143,87 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
         name = f"layers.{owned_layer}.engram.wkv.weight"
         assert loaded == {name}
         torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("backend", ["nvidia", "amd"])
+@pytest.mark.parametrize("use_slot_cache", [False, True])
+@pytest.mark.parametrize(
+    "metadata,cache_bound", [(False, False), (True, False), (True, True)]
+)
+def test_engram_profile_stages_dead_rows(
+    monkeypatch, backend, metadata, cache_bound, use_slot_cache
+):
+    """Unbound profiling includes Engram buffers; serving still hashes real tokens."""
+    from vllm.models.deepseek_v4_1.common.engram import DEAD_ID, NgramHashState
+
+    model_module = import_module(f"vllm.models.deepseek_v4_1.{backend}.model")
+    tokens, layers, heads = 5, 2, 6
+    hashes = torch.ones(tokens, layers, heads, dtype=torch.int32)
+    staged = []
+
+    class StopAtDecoder(Exception):
+        pass
+
+    class HashState(NgramHashState):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.layout = SimpleNamespace(
+                layer_ids=[1, 14], max_ngram_size=4, n_heads=2
+            )
+            self.use_slot_cache = use_slot_cache
+            self.block_size = 1
+            self._cache = self._kv_cache_ref = None
+            self.swa_cache_module = SimpleNamespace(
+                kv_cache=torch.ones(1) if cache_bound else torch.empty(0)
+            )
+
+        def forward(self, *args):
+            assert metadata and cache_bound
+            return hashes
+
+    class Decoder:
+        engram = SimpleNamespace(layer_hash_index=1, prepare_embeddings=staged.append)
+
+        def __call__(self, *args):
+            actual_hashes, keep = args[-2:]
+            assert actual_hashes.shape == (tokens, layers, heads)
+            assert actual_hashes.dtype == torch.int32
+            assert keep.shape == (tokens,) and keep.dtype == torch.bool
+            assert len(staged) == 1
+            torch.testing.assert_close(staged[0], actual_hashes[:, 1])
+            if metadata and cache_bound:
+                assert actual_hashes is hashes and keep.all()
+            else:
+                assert (actual_hashes == DEAD_ID).all() and not keep.any()
+            raise StopAtDecoder
+
+    swa = SimpleNamespace(query_start_loc=None, slot_mapping=None, block_table=None)
+    monkeypatch.setattr(
+        model_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    monkeypatch.setattr(model_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        model_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"swa": swa} if metadata else None),
+    )
+    model = SimpleNamespace(
+        use_mega_moe=False,
+        use_sequence_parallel=False,
+        engram_hash=HashState(),
+        engram_swa_prefix="swa",
+        layers=[Decoder()],
+        start_layer=0,
+        end_layer=1,
+    )
+    with pytest.raises(StopAtDecoder):
+        model_module.DeepseekV4Model.forward(
+            model,
+            torch.arange(tokens),
+            torch.arange(tokens),
+            None,
+            inputs_embeds=torch.ones(tokens, 4, 8),
+            lookback_token_ids=torch.zeros(1, 3, dtype=torch.int64),
+        )
