@@ -270,6 +270,9 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # No scheduled request can use drafts produced after this step.
+    skip_drafts: bool = False
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

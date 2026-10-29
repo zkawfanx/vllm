@@ -5730,3 +5730,49 @@ def test_hybrid_per_group_hit_divergence_fa_deeper_no_external():
     num_scheduled = output.num_scheduled_tokens[replay.request_id]
     # Must resume at the convergent boundary (block 0), not the deep FA hit.
     assert replay.num_tokens - num_scheduled == block_size
+
+
+@pytest.mark.parametrize(
+    "computed,new_tokens,outputs,pending,max_tokens,unused",
+    [
+        (0, 9, 0, 0, 1, True),  # partial prompt budget
+        (0, 10, 0, 0, 2, False),  # final prefill still needs drafts
+        (0, 10, 0, 0, 1, True),
+        (10, 1, 1, 0, 2, True),
+        (10, 1, 1, 6, 4, False),  # pending draft tokens may all be rejected
+        (10, 1, 1, 6, 3, True),  # one guaranteed token per pending step
+    ],
+)
+def test_unused_drafts_count_only_guaranteed_outputs(
+    computed, new_tokens, outputs, pending, max_tokens, unused
+):
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(
+        num_tokens=10,
+        num_output_tokens=outputs,
+        num_output_placeholders=pending,
+        max_tokens=max_tokens,
+    )
+    assert Scheduler._drafts_unused(request, computed, new_tokens) is unused
+
+
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("mixed_decode", [False, True])
+def test_unused_drafts_preserve_mixed_batch(async_scheduling, mixed_decode):
+    scheduler = create_scheduler(
+        max_num_batched_tokens=16,
+        max_model_len=128,
+        async_scheduling=async_scheduling,
+        use_v2_model_runner=True,
+    )
+    # Exercise scheduling independently of draft checkpoint initialization.
+    scheduler.can_skip_drafts = True
+    if mixed_decode:
+        (decode,) = create_requests(num_requests=1, num_tokens=1, max_tokens=8)
+        scheduler.add_request(decode)
+    (prefill,) = create_requests(num_requests=1, num_tokens=32, max_tokens=8)
+    scheduler.add_request(prefill)
+    output = scheduler.schedule()
+    assert output.skip_drafts is (not mixed_decode)
+    assert output.num_scheduled_tokens[prefill.request_id] < 32
