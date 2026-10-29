@@ -328,14 +328,20 @@ class DeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP, Supports
         return self.language_model.get_mtp_target_hidden_states()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Map HF names into this wrapper's namespace up front and sort, so
-        # the "language_model." group reaches the child loader as one
-        # contiguous block (AutoWeightsLoader delegates per contiguous group,
-        # and the child's load_weights finalizes fused expert weights, which
-        # must not run on a partially loaded model).
-        mapped = sorted(self.hf_to_vllm_mapper.apply(weights), key=lambda x: x[0])
+        def language_model_first():
+            deferred = []
+            for name, tensor in self.hf_to_vllm_mapper.apply(weights):
+                if name.startswith("language_model."):
+                    yield name, tensor
+                else:
+                    # Release shard storage and survive loader buffer reuse.
+                    deferred.append((name, tensor.clone()))
+            yield from deferred
+
+        # The child finalizes once per contiguous group; sorting would retain
+        # the entire checkpoint before loading the first language-model weight.
         loader = AutoWeightsLoader(self)
-        loaded_params = loader.load_weights(mapped)
+        loaded_params = loader.load_weights(language_model_first())
         # The child's load_weights already ran its post-load finalization.
         self._weights_finalized = True
         return loaded_params
