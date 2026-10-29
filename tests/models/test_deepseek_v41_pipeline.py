@@ -143,3 +143,83 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
         name = f"layers.{owned_layer}.engram.wkv.weight"
         assert loaded == {name}
         torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("first_rank", [False, True])
+@pytest.mark.parametrize("raw_tokens", [False, True])
+@pytest.mark.parametrize("dummy_run", [False, True])
+def test_v2_pipeline_preserves_required_token_ids(
+    monkeypatch, first_rank, raw_tokens, dummy_run
+):
+    """Profiling and execution must retain token-dependent routing on every stage."""
+    from contextlib import nullcontext
+    from unittest.mock import MagicMock
+
+    from vllm.config import CUDAGraphMode
+    from vllm.sequence import IntermediateTensors
+    from vllm.v1.worker.gpu import model_runner as runner_module
+
+    class ForwardReached(Exception):
+        pass
+
+    ids = torch.tensor([101, 102, 103])
+    batch = SimpleNamespace(
+        input_ids=ids,
+        positions=torch.arange(3),
+        num_tokens=3,
+        num_tokens_after_padding=3,
+        is_padding=torch.zeros(3, dtype=torch.bool),
+    )
+    incoming = IntermediateTensors({"hidden_states": torch.ones(3, 2)})
+
+    def forward(**kwargs):
+        expected_ids = ids if first_rank or raw_tokens else None
+        assert kwargs["input_ids"] is expected_ids
+        assert kwargs["inputs_embeds"] is None
+        if first_rank:
+            assert kwargs["intermediate_tensors"] is None
+        else:
+            expected_hidden = runner.intermediate_tensors if dummy_run else incoming
+            torch.testing.assert_close(
+                kwargs["intermediate_tensors"]["hidden_states"],
+                expected_hidden["hidden_states"],
+            )
+        raise ForwardReached
+
+    runner = MagicMock()
+    runner.model = MagicMock(side_effect=forward)
+    runner.model.requires_raw_input_tokens = raw_tokens
+    runner.is_first_pp_rank = first_rank
+    runner.supports_mm_inputs = False
+    runner.is_encoder_decoder = False
+    runner.lora_config = None
+    runner.prepare_inputs.return_value = batch
+    runner.prepare_attn.return_value = ({}, {})
+    runner.intermediate_tensors = IntermediateTensors(
+        {"hidden_states": torch.zeros(3, 2)}
+    )
+    desc = SimpleNamespace(
+        num_tokens=3, num_reqs=1, cg_mode=CUDAGraphMode.NONE, num_active_loras=0
+    )
+    monkeypatch.setattr(
+        runner_module, "dispatch_cg_and_sync_dp", lambda *a, **k: (desc, None)
+    )
+    monkeypatch.setattr(runner_module.InputBatch, "make_dummy", lambda *a: batch)
+    monkeypatch.setattr(runner_module, "build_slot_mappings_by_layer", lambda *a: {})
+    monkeypatch.setattr(
+        runner_module, "set_forward_context", lambda *a, **k: nullcontext()
+    )
+    scheduler = SimpleNamespace(
+        total_num_scheduled_tokens=3, num_scheduled_tokens={"a": 3}
+    )
+    with pytest.raises(ForwardReached):
+        runner_module.GPUModelRunner.execute_model(
+            runner,
+            scheduler,
+            intermediate_tensors=incoming,
+            dummy_run=dummy_run,
+            skip_attn_for_dummy_run=dummy_run,
+            is_profile=dummy_run,
+        )
