@@ -626,6 +626,13 @@ class Scheduler(SchedulerInterface):
                         break
 
             if new_blocks is None:
+                if (
+                    self.policy == SchedulingPolicy.PRIORITY
+                    and request.status == RequestStatus.PREEMPTED
+                ):
+                    # Self-preemption removed the current request, so the cursor
+                    # now points at a higher-priority request that may still fit.
+                    continue
                 # Cannot schedule this request.
                 break
 
