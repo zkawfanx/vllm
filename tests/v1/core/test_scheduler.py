@@ -5732,6 +5732,41 @@ def test_hybrid_per_group_hit_divergence_fa_deeper_no_external():
     assert replay.num_tokens - num_scheduled == block_size
 
 
+@pytest.mark.parametrize("drafts,expected", [([1, 9, 2], [1, 9]), ([1, -1, -1], [1])])
+def test_sync_preserves_first_grammar_invalid_proposal(drafts, expected):
+    from types import SimpleNamespace
+
+    scheduler = Scheduler.__new__(Scheduler)
+    request = SimpleNamespace(
+        is_finished=lambda: False,
+        is_prefill_chunk=False,
+        use_structured_output=True,
+        spec_token_ids=[],
+        structured_output_request=SimpleNamespace(
+            grammar=SimpleNamespace(
+                is_terminated=lambda: False, validate_tokens=lambda tokens: tokens[:1]
+            )
+        ),
+    )
+    scheduler.requests = {"r": request}
+    scheduler.structured_output_manager = SimpleNamespace(should_advance=lambda r: True)
+    scheduler.update_draft_token_ids(DraftTokenIds(["r"], [drafts]))
+    assert request.spec_token_ids == expected
+
+
+def test_async_preserves_grammar_invalid_proposals():
+    from types import SimpleNamespace
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.requests = {"r": SimpleNamespace(is_finished=lambda: False)}
+    output = SimpleNamespace(scheduled_spec_decode_tokens={"r": [-1, -1, -1]})
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(["r"], [[1, 9, 2]]), output
+    )
+    assert output.scheduled_spec_decode_tokens["r"] == [1, 9, 2]
+    assert output.num_invalid_spec_tokens == {}
+
+
 @pytest.mark.parametrize(
     "computed,new_tokens,outputs,pending,max_tokens,unused",
     [
