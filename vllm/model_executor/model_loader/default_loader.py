@@ -11,7 +11,7 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, get_current_vllm_config_or_none
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
@@ -270,9 +270,23 @@ class DefaultModelLoader(BaseModelLoader):
                     self.load_config.use_tqdm_on_load,
                 )
             elif self.load_config.load_format == "instanttensor":
+                vllm_config = get_current_vllm_config_or_none()
+                engram_config = vllm_config.engram_config if vllm_config else None
+                load_engram_on_cpu = bool(engram_config and engram_config.cpu_offload)
+                if vllm_config and engram_config is None:
+                    # V4.1 stores Engram tables on CPU when no config is supplied.
+                    model_config = vllm_config.model_config
+                    load_engram_on_cpu = bool(
+                        model_config
+                        and model_config.architecture == "DeepseekV41ForCausalLM"
+                        and getattr(
+                            model_config.hf_text_config, "engram_layer_ids", None
+                        )
+                    )
                 weights_iterator = instanttensor_weights_iterator(
                     hf_weights_files,
                     self.load_config.use_tqdm_on_load,
+                    load_engram_on_cpu=load_engram_on_cpu,
                 )
             else:
                 if extra_config.get("enable_multithread_load"):
