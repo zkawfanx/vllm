@@ -269,6 +269,16 @@ class Scheduler(SchedulerInterface):
                 # query), so it needs exactly num_spec_tokens lookahead slots.
                 self.num_lookahead_tokens = self.num_spec_tokens
 
+        # Skipping a draft forward requires rank agreement for DP and a separate
+        # in-flight-token proof for PP. Keep those execution paths unchanged.
+        self.can_skip_drafts = (
+            vllm_config.use_v2_model_runner
+            and self.parallel_config.data_parallel_size == 1
+            and self.parallel_config.pipeline_parallel_size == 1
+            and speculative_config is not None
+            and (speculative_config.use_dflash() or speculative_config.use_dspark())
+        )
+
         # Create the KV cache manager.
         if hash_block_size is None:
             hash_block_size = block_size
@@ -437,6 +447,20 @@ class Scheduler(SchedulerInterface):
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
 
+    @staticmethod
+    def _drafts_unused(
+        request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> bool:
+        # A non-final prefill chunk has no sampled token to verify next step.
+        if num_computed_tokens + num_new_tokens < request.num_tokens:
+            return True
+        # Each sampling step produces at least one token even if all drafts are
+        # rejected. PP1 async scheduling has at most one prior step in flight.
+        min_output_tokens = request.num_output_tokens + 1
+        if request.num_output_placeholders > 0:
+            min_output_tokens += 1
+        return min_output_tokens >= request.max_tokens
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
@@ -467,6 +491,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        drafts_needed = not self.can_skip_drafts
         # Whether the running batch contains any prefill requests.
         prefill_scheduled = False
 
@@ -637,6 +662,9 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
+            drafts_needed = drafts_needed or not self._drafts_unused(
+                request, request.num_computed_tokens, num_new_tokens
+            )
 
             # Speculative decode related.
             if request.spec_token_ids:
@@ -1078,6 +1106,9 @@ class Scheduler(SchedulerInterface):
                 token_budget -= num_new_tokens
                 request.status = RequestStatus.RUNNING
                 request.num_computed_tokens = num_computed_tokens
+                drafts_needed = drafts_needed or not self._drafts_unused(
+                    request, num_computed_tokens, num_new_tokens
+                )
                 if pad_spec_decode:
                     scheduled_spec_decode_tokens[request_id] = [
                         -1
@@ -1230,6 +1261,7 @@ class Scheduler(SchedulerInterface):
             kv_cache_block_copies=pending_kv_cache_block_copies,
             partial_tail_offloads=pending_partial_tail_offloads,
             num_spec_tokens_to_schedule=num_spec_tokens_to_schedule,
+            skip_drafts=not drafts_needed,
             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
         )
 
