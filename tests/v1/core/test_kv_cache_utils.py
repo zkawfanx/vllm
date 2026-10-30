@@ -2118,6 +2118,36 @@ def new_swa_mla_spec(head_size=576, sliding_window=128):
     )
 
 
+@pytest.mark.parametrize(
+    ("cache_dtype", "dtype", "quant_mode"),
+    [
+        ("auto", torch.bfloat16, KVQuantMode.NONE),
+        ("fp8", torch.float8_e4m3fn, KVQuantMode.FP8_PER_TENSOR),
+        ("fp8_ds_mla", torch.uint8, KVQuantMode.FP8_PER_TENSOR),
+    ],
+)
+def test_group_swa_mla_preserves_kv_quantization(cache_dtype, dtype, quant_mode):
+    """Grouping must retain the format used to select the physical KV shape."""
+    spec = SlidingWindowMLASpec(
+        block_size=32,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=dtype,
+        sliding_window=128,
+        cache_dtype_str=cache_dtype,
+        model_version="deepseek_v4",
+        kv_quant_mode=quant_mode,
+    )
+
+    groups = get_kv_cache_groups(_grouping_config(), {"swa.0": spec, "swa.1": spec})
+
+    assert len(groups) == 1
+    merged_spec = groups[0].kv_cache_spec
+    assert merged_spec.kv_quant_mode == quant_mode
+    assert merged_spec.cache_dtype_str == cache_dtype
+    assert merged_spec.page_size_bytes == spec.page_size_bytes
+
+
 def test_group_and_unify_kv_cache_specs_no_swa_mla_returns_none():
     # Without any SlidingWindowMLASpec the function does not apply.
     specs = {"mla.0": new_mla_spec(), "mla.1": new_mla_spec()}
