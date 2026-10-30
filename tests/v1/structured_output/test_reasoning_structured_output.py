@@ -350,3 +350,63 @@ class TestReasoningStructuredOutput:
         assert manager_with_reasoner.trim_reasoning_for_advance(
             mock_request_with_structured_output, new_token_ids
         ) == [271, 5005]
+
+
+@pytest.mark.parametrize(
+    "drafts,reasoning,expected",
+    [
+        ([1, 9, 2], False, [1, 2, -1, -1]),
+        ([1, -1, -1], False, [1, 2, -1, -1]),
+        ([1, 2], False, [1, 2, 3]),
+        ([8, 1, 9], True, [-1, 1, 2, -1]),
+    ],
+)
+def test_speculative_masks_stop_after_invalid_proposal(drafts, reasoning, expected):
+    """Only the first rejected row matters; speculative state must be restored."""
+    from types import SimpleNamespace
+
+    import torch
+
+    class Grammar:
+        state = 0
+
+        def is_terminated(self):
+            return False
+
+        def fill_bitmask(self, masks, row):
+            masks[row].fill_(self.state + 1)
+
+        def accept_tokens(self, request_id, tokens):
+            if tokens != [self.state + 1]:
+                return False
+            self.state += 1
+            return True
+
+        def rollback(self, count):
+            self.state -= count
+
+    grammar = Grammar()
+    manager = StructuredOutputManager.__new__(StructuredOutputManager)
+    manager.vllm_config = SimpleNamespace(
+        num_speculative_tokens=3, model_config=SimpleNamespace(is_diffusion=False)
+    )
+    manager._grammar_bitmask = torch.empty((4, 1), dtype=torch.int32)
+    manager._full_mask = -1
+    manager.fill_bitmask_parallel_threshold = 16
+    manager.enable_in_reasoning = False
+    manager.should_fill_bitmask = lambda request: not reasoning
+    manager._get_reasoner = lambda request: (
+        SimpleNamespace(is_reasoning_end_streaming=lambda history, delta: delta == [8])
+        if reasoning
+        else None
+    )
+    request = SimpleNamespace(
+        structured_output_request=SimpleNamespace(grammar=grammar), all_token_ids=[]
+    )
+    masks = manager.grammar_bitmask({"r": request}, ["r"], {"r": drafts})
+    assert masks[:, 0].tolist() == expected
+    assert grammar.state == 0
+    # A later call must overwrite rows made unconstrained by the invalid suffix.
+    if not reasoning:
+        masks = manager.grammar_bitmask({"r": request}, ["r"], {"r": [1, 2]})
+        assert masks[:, 0].tolist() == [1, 2, 3]

@@ -41,14 +41,21 @@ from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
     not current_platform.is_cuda() and os.environ.get("TRITON_INTERPRET") != "1",
     reason="CUDA or Triton interpreter required",
 )
-def test_v41_ring_slot_mapping_excludes_null_block():
+@pytest.mark.parametrize(
+    "num_actual_tokens,num_tokens", [(1, 1), (15, 16), (16, 16), (16, 17), (17, 17)]
+)
+@pytest.mark.parametrize("block_table_stride", [1, 16, 17])
+def test_v41_ring_slot_mapping_excludes_null_block(
+    num_actual_tokens, num_tokens, block_table_stride
+):
     """Null blocks and padding must not receive compressor ring writes."""
     from vllm.models.deepseek_v4_1.compressor import _ring_slot_mapping_kernel
 
     device = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
-    positions = torch.tensor([13, 14, 15, 7, 8, 0, 1, 0, 0, 0], device=device)
-    requests = torch.tensor([0, 0, 0, 1, 1, 2, 2], dtype=torch.int32, device=device)
-    blocks = torch.tensor([[5, -1], [2, -1], [0, -1]], dtype=torch.int32, device=device)
+    positions = torch.arange(num_tokens, device=device) + 13
+    requests = torch.arange(num_actual_tokens, dtype=torch.int32, device=device) % 3
+    blocks = torch.full((3, block_table_stride), -1, dtype=torch.int32, device=device)
+    blocks[:, 0] = torch.tensor([5, 2, 0], device=device)
     slots = torch.full_like(positions, -99)
 
     _ring_slot_mapping_kernel[(1,)](
@@ -63,7 +70,13 @@ def test_v41_ring_slot_mapping_excludes_null_block():
         BLOCK=256,
     )
 
-    expected = torch.tensor([45, 46, 47, 23, 16, -1, -1, -1, -1, -1], device=device)
+    expected = torch.full_like(positions, -1)
+    real_blocks = blocks[requests.long(), 0].long()
+    expected[:num_actual_tokens] = torch.where(
+        real_blocks != 0,
+        real_blocks * 8 + positions[:num_actual_tokens] % 8,
+        -1,
+    )
     torch.testing.assert_close(slots, expected)
 
 
