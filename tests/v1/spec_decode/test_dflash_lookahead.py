@@ -302,7 +302,8 @@ def test_dflash_context_capture_preserves_cache_rows(
     draft = mod.DFlashSpeculator.__new__(mod.DFlashSpeculator)
     draft.max_num_tokens, draft.max_num_reqs = 10, 4
     draft.num_speculative_steps, draft.num_query_per_req = 3, 3
-    draft.max_model_len, draft.dp_size, draft.dp_rank = 100, 1, 0
+    draft.dp_size, draft.dp_rank = 1, 0
+    draft.vllm_config = SimpleNamespace(model_config=SimpleNamespace(max_model_len=100))
     draft._speculator_name = "DSpark"
     draft.sample_from_anchor = True
     draft.hidden_states = torch.zeros(10, 2)

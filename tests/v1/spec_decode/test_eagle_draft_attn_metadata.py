@@ -16,6 +16,7 @@ backends (e.g. ``ROCM_AITER_FA`` with eagle/eagle3 spec decode):
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 
 from vllm.v1.worker.gpu.spec_decode import speculator as base_speculator
@@ -28,7 +29,7 @@ def _make_fake_speculator(
     max_num_tokens: int = 16,
     max_model_len: int = 1024,
     draft_max_seq_len: int = 1024,
-) -> SimpleNamespace:
+) -> EagleSpeculator:
     """Build a fake EagleSpeculator with just the attributes used by
     ``_build_draft_attn_metadata``. We deliberately avoid constructing a
     real ``EagleSpeculator`` because that requires a full ``VllmConfig``
@@ -42,15 +43,19 @@ def _make_fake_speculator(
         input_block_tables=[torch.zeros(max_num_reqs, 4, dtype=torch.int32)],
         slot_mappings=torch.zeros(1, max_num_tokens, dtype=torch.int64),
     )
-    return SimpleNamespace(
+    speculator = object.__new__(EagleSpeculator)
+    speculator.__dict__.update(
         arange=torch.arange(max_num_reqs + 1, dtype=torch.int32, device="cpu"),
         block_tables=fake_block_tables,
         input_buffers=fake_input_buffers,
         attn_groups=[],
         kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
-        max_model_len=max_model_len,
+        vllm_config=SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=max_model_len)
+        ),
         draft_max_seq_len=draft_max_seq_len,
     )
+    return speculator
 
 
 def _run_build(fake, *, num_reqs, num_reqs_padded, num_tokens_padded, base, step):
@@ -126,3 +131,22 @@ def test_build_draft_attn_metadata_clamps_to_max_model_len():
     bound = captured["seq_lens_cpu_upper_bound"]
     # 1023 + 3 = 1026 -> clamped to 1024; 500 + 3 = 503 unaffected.
     assert torch.equal(bound, torch.tensor([1024, 503], dtype=torch.int32))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("fitted_limit, expected_max", [(512, 512), (1024, 768)])
+def test_draft_metadata_uses_auto_fit_limit(fitted_limit, expected_max):
+    speculator = _make_fake_speculator(draft_max_seq_len=768)
+    speculator.vllm_config.model_config.max_model_len = fitted_limit
+
+    captured = _run_build(
+        speculator,
+        num_reqs=1,
+        num_reqs_padded=2,
+        num_tokens_padded=2,
+        base=torch.tensor([511], dtype=torch.int32),
+        step=3,
+    )
+
+    assert captured["max_seq_len"] == expected_max
+    assert captured["seq_lens_cpu_upper_bound"].tolist() == [min(514, fitted_limit), 0]

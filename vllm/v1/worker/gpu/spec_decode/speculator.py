@@ -81,7 +81,6 @@ class DraftModelSpeculator(BaseSpeculator):
         self.scheduler_config = vllm_config.scheduler_config
         self.max_num_reqs = self.scheduler_config.max_num_seqs
         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
-        self.max_model_len = vllm_config.model_config.max_model_len
         self.draft_max_seq_len = self.max_model_len
         # We need to get the hidden size from the draft model config because
         # the draft model's hidden size can be different from the target model's
@@ -136,6 +135,11 @@ class DraftModelSpeculator(BaseSpeculator):
                 dtype=torch.float32,
                 device=device,
             )
+
+    @property
+    def max_model_len(self) -> int:
+        # Auto-fit can reduce the limit after the speculator is built.
+        return self.vllm_config.model_config.max_model_len
 
     @abstractmethod
     def load_draft_model(
@@ -260,7 +264,7 @@ class DraftModelSpeculator(BaseSpeculator):
             query_start_loc_cpu=query_start_loc_cpu,
             max_query_len=max_query_len,
             seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
-            max_seq_len=self.draft_max_seq_len,
+            max_seq_len=min(self.draft_max_seq_len, self.max_model_len),
             block_tables=block_tables,
             slot_mappings=slot_mappings,
             kv_cache_config=self.kv_cache_config,
