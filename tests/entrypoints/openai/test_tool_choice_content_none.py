@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
 import pytest
 from openai.types.chat.chat_completion import ChatCompletion as OpenAIChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
@@ -18,6 +20,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     DeltaToolCall,
     FunctionCall,
+    PromptTokenUsageInfo,
     ToolCall,
     UsageInfo,
 )
@@ -151,6 +154,50 @@ def test_chat_completion_response_keeps_non_empty_tool_calls_payload():
 
     assert len(message["tool_calls"]) == 1
     assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_chat_response_omits_null_optional_details(explicit_none):
+    message = ChatMessage(role="assistant", content=None)
+    response = _chat_response(message)
+    if explicit_none:
+        message.annotations = None
+        response.usage.prompt_tokens_details = None
+
+    for payload in (response.model_dump(), json.loads(response.model_dump_json())):
+        assert "annotations" not in payload["choices"][0]["message"]
+        assert "prompt_tokens_details" not in payload["usage"]
+        assert payload["choices"][0]["message"]["content"] is None
+
+
+@pytest.mark.parametrize(
+    "annotations",
+    [
+        [],
+        [
+            {
+                "type": "url_citation",
+                "url_citation": {
+                    "start_index": 0,
+                    "end_index": 4,
+                    "title": "t",
+                    "url": "https://example.com",
+                },
+            }
+        ],
+    ],
+)
+def test_chat_response_preserves_annotations_and_prompt_details(annotations):
+    response = _chat_response(
+        ChatMessage(role="assistant", content="done", annotations=annotations)
+    )
+    response.usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=0)
+
+    payload = json.loads(response.model_dump_json())
+    assert payload["choices"][0]["message"]["annotations"] == annotations
+    parsed = OpenAIChatCompletion.model_validate(payload)
+    assert len(parsed.choices[0].message.annotations) == len(annotations)
+    assert parsed.usage.prompt_tokens_details.cached_tokens == 0
 
 
 def _stream_response(delta: DeltaMessage) -> ChatCompletionStreamResponse:
