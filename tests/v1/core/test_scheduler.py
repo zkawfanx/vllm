@@ -5769,9 +5769,13 @@ def test_unused_drafts_preserve_mixed_batch(async_scheduling, mixed_decode):
     # Exercise scheduling independently of draft checkpoint initialization.
     scheduler.can_skip_drafts = True
     if mixed_decode:
-        (decode,) = create_requests(num_requests=1, num_tokens=1, max_tokens=8)
+        (decode,) = create_requests(
+            num_requests=1, num_tokens=1, max_tokens=8, req_ids=["decode"]
+        )
         scheduler.add_request(decode)
-    (prefill,) = create_requests(num_requests=1, num_tokens=32, max_tokens=8)
+    (prefill,) = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=8, req_ids=["prefill"]
+    )
     scheduler.add_request(prefill)
     output = scheduler.schedule()
     assert output.skip_drafts is (not mixed_decode)
