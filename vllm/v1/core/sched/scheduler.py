@@ -2182,9 +2182,17 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
+            if request.use_structured_output and -1 in spec_token_ids:
+                spec_token_ids = spec_token_ids[: spec_token_ids.index(-1)]
             if self.structured_output_manager.should_advance(request):
                 metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+                grammar = metadata.grammar  # type: ignore[union-attr]
+                if grammar.is_terminated():
+                    spec_token_ids = []
+                else:
+                    # Keep the first invalid proposal for residual resampling.
+                    num_valid = len(grammar.validate_tokens(spec_token_ids))
+                    spec_token_ids = spec_token_ids[: num_valid + 1]
             request.spec_token_ids = spec_token_ids
 
     def update_draft_token_ids_in_output(
@@ -2210,10 +2218,8 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            if self.structured_output_manager.should_advance(request):
-                metadata = request.structured_output_request
-                spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
+            # Preserve proposals: grammar masking and rejection sampling handle
+            # invalid drafts without changing their sampling distribution.
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:
