@@ -9,6 +9,116 @@ import torch
 
 @pytest.mark.cpu_test
 @pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("model_name", ["deepseek_v4", "deepseek_v4_1"])
+@pytest.mark.parametrize("num_redundant_experts", [0, 2, 6])
+def test_expert_mapping_loads_every_physical_slot(model_name, num_redundant_experts):
+    """Replica slots must load the checkpoint weights of their logical expert."""
+    model_module = import_module(f"vllm.models.{model_name}.nvidia.model")
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(n_routed_experts=4)
+    model.start_layer, model.end_layer = 1, 2
+    model.layers = [
+        None,
+        SimpleNamespace(
+            ffn=SimpleNamespace(
+                use_mega_moe=False, n_redundant_experts=num_redundant_experts
+            )
+        ),
+    ]
+
+    mapping = model_module.DeepseekV4Model.get_expert_mapping(model)
+
+    assert mapping == [
+        (
+            "experts.routed_experts.w2_"
+            if shard == "w2"
+            else "experts.routed_experts.w13_",
+            f"experts.{physical_id % 4}.{shard}.",
+            physical_id,
+            shard,
+        )
+        for physical_id in range(4 + num_redundant_experts)
+        for shard in ("w1", "w2", "w3")
+    ]
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("model_name", ["deepseek_v4", "deepseek_v4_1"])
+@pytest.mark.parametrize("num_redundant_experts", [0, 2, 6])
+@pytest.mark.parametrize("ep_rank", [0, 1])
+def test_expert_loader_initializes_all_local_replicas(
+    monkeypatch, model_name, num_redundant_experts, ep_rank
+):
+    """Every local physical copy receives all three checkpoint projections."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    model_module = import_module(f"vllm.models.{model_name}.nvidia.model")
+    monkeypatch.setattr(model_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(model_module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        model_module,
+        "is_pp_missing_parameter",
+        lambda name, _: name.startswith("remote."),
+    )
+    num_local_experts = (4 + num_redundant_experts) // 2
+    start = ep_rank * num_local_experts
+    experts = RoutedExperts.__new__(RoutedExperts)
+    torch.nn.Module.__init__(experts)
+    experts.quant_config = None
+    experts.quant_method = SimpleNamespace()
+    experts.moe_config = SimpleNamespace(
+        tp_rank=0, is_act_and_mul=True, moe_parallel_config=SimpleNamespace(tp_size=1)
+    )
+    experts.expert_map_manager = SimpleNamespace(
+        map_global_to_local=lambda expert: (
+            expert - start if start <= expert < start + num_local_experts else -1
+        )
+    )
+    params = {
+        f"ffn.experts.routed_experts.{name}": torch.nn.Parameter(
+            torch.full((num_local_experts, rows, 2), float("nan")), requires_grad=False
+        )
+        for name, rows in (("w13_weight", 4), ("w2_weight", 2))
+    }
+    for param in params.values():
+        param.weight_loader = experts.weight_loader
+    model = SimpleNamespace(
+        config=SimpleNamespace(num_attention_heads=1, n_routed_experts=4),
+        quant_config=None,
+        use_sequence_parallel=False,
+        named_parameters=lambda: params.items(),
+    )
+    model.get_expert_mapping = lambda: RoutedExperts.make_expert_params_mapping(
+        model, "w1", "w2", "w3", 4, num_redundant_experts
+    )
+    weights = {
+        f"ffn.experts.{expert}.{shard}.weight": torch.full(
+            (2, 2), float(10 * expert + i)
+        )
+        for expert in range(4)
+        for i, shard in enumerate(("w1", "w2", "w3"), start=1)
+    }
+    loaded = model_module.DeepseekV4Model.load_weights(model, weights.items())
+    assert loaded == set(params)
+    for local_id in range(num_local_experts):
+        logical_id = (start + local_id) % 4
+        for shard, param_name, rows in (
+            ("w1", "w13_weight", slice(0, 2)),
+            ("w3", "w13_weight", slice(2, 4)),
+            ("w2", "w2_weight", slice(None)),
+        ):
+            torch.testing.assert_close(
+                params[f"ffn.experts.routed_experts.{param_name}"][local_id, rows],
+                weights[f"ffn.experts.{logical_id}.{shard}.weight"],
+            )
+    assert not model_module.DeepseekV4Model.load_weights(
+        model, ((f"remote.{name}", weight) for name, weight in weights.items())
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("num_tokens", [0, 1, 5, 8])
 def test_sequence_parallel_token_ids_stay_aligned_with_hidden_rows(
     monkeypatch, num_tokens
@@ -143,3 +253,87 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
         name = f"layers.{owned_layer}.engram.wkv.weight"
         assert loaded == {name}
         torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("backend", ["nvidia", "amd"])
+@pytest.mark.parametrize("use_slot_cache", [False, True])
+@pytest.mark.parametrize(
+    "metadata,cache_bound", [(False, False), (True, False), (True, True)]
+)
+def test_engram_profile_stages_dead_rows(
+    monkeypatch, backend, metadata, cache_bound, use_slot_cache
+):
+    """Unbound profiling includes Engram buffers; serving still hashes real tokens."""
+    from vllm.models.deepseek_v4_1.common.engram import DEAD_ID, NgramHashState
+
+    model_module = import_module(f"vllm.models.deepseek_v4_1.{backend}.model")
+    tokens, layers, heads = 5, 2, 6
+    hashes = torch.ones(tokens, layers, heads, dtype=torch.int32)
+    staged = []
+
+    class StopAtDecoder(Exception):
+        pass
+
+    class HashState(NgramHashState):
+        def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.layout = SimpleNamespace(
+                layer_ids=[1, 14], max_ngram_size=4, n_heads=2
+            )
+            self.use_slot_cache = use_slot_cache
+            self.block_size = 1
+            self._cache = self._kv_cache_ref = None
+            self.swa_cache_module = SimpleNamespace(
+                kv_cache=torch.ones(1) if cache_bound else torch.empty(0)
+            )
+
+        def forward(self, *args):
+            assert metadata and cache_bound
+            return hashes
+
+    class Decoder:
+        engram = SimpleNamespace(layer_hash_index=1, prepare_embeddings=staged.append)
+
+        def __call__(self, *args):
+            actual_hashes, keep = args[-2:]
+            assert actual_hashes.shape == (tokens, layers, heads)
+            assert actual_hashes.dtype == torch.int32
+            assert keep.shape == (tokens,) and keep.dtype == torch.bool
+            assert len(staged) == 1
+            torch.testing.assert_close(staged[0], actual_hashes[:, 1])
+            if metadata and cache_bound:
+                assert actual_hashes is hashes and keep.all()
+            else:
+                assert (actual_hashes == DEAD_ID).all() and not keep.any()
+            raise StopAtDecoder
+
+    swa = SimpleNamespace(query_start_loc=None, slot_mapping=None, block_table=None)
+    monkeypatch.setattr(
+        model_module, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    monkeypatch.setattr(model_module, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        model_module,
+        "get_forward_context",
+        lambda: SimpleNamespace(attn_metadata={"swa": swa} if metadata else None),
+    )
+    model = SimpleNamespace(
+        use_mega_moe=False,
+        use_sequence_parallel=False,
+        engram_hash=HashState(),
+        engram_swa_prefix="swa",
+        layers=[Decoder()],
+        start_layer=0,
+        end_layer=1,
+    )
+    with pytest.raises(StopAtDecoder):
+        model_module.DeepseekV4Model.forward(
+            model,
+            torch.arange(tokens),
+            torch.arange(tokens),
+            None,
+            inputs_embeds=torch.ones(tokens, 4, 8),
+            lookback_token_ids=torch.zeros(1, 3, dtype=torch.int64),
+        )
