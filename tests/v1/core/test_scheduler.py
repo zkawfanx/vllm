@@ -5131,6 +5131,43 @@ def test_eagle3_mm_encoder_cache_with_shift():
     )
 
 
+@pytest.mark.parametrize("already_running", [False, True])
+def test_repeated_encoder_input_stays_pinned_across_prefill_chunks(already_running):
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf", max_num_batched_tokens=24
+    )
+    offset = 24 if already_running else 0
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_hashes_list=[["image", "image"]],
+        mm_positions=[
+            [
+                PlaceholderRange(offset=offset, length=16),
+                PlaceholderRange(offset=offset + 16, length=16),
+            ]
+        ],
+    )[0]
+    scheduler.add_request(request)
+    if already_running:
+        scheduler.schedule()
+    output = scheduler.schedule()
+    manager = scheduler.encoder_cache_manager
+
+    assert output.scheduled_encoder_inputs[request.request_id] == [0]
+    assert manager.get_cached_input_ids(request) == {0, 1}
+    assert manager.request_hash_refs[request.request_id] == {"image": 2}
+    request.num_computed_tokens = offset + 24
+    scheduler._free_encoder_inputs(request)
+    assert manager.get_cached_input_ids(request) == {1}
+    assert "image" not in manager.freeable
+
+    request.num_computed_tokens = offset + 32
+    scheduler._free_encoder_inputs(request)
+    assert manager.get_cached_input_ids(request) == set()
+    assert manager.freeable["image"] == 16
+
+
 def test_free_encoder_inputs_respects_unconfirmed_placeholders():
     """Regression test for issue #38551 (rollback path): under async
     scheduling with speculative decoding, num_computed_tokens is advanced
@@ -5732,6 +5769,41 @@ def test_hybrid_per_group_hit_divergence_fa_deeper_no_external():
     num_scheduled = output.num_scheduled_tokens[replay.request_id]
     # Must resume at the convergent boundary (block 0), not the deep FA hit.
     assert replay.num_tokens - num_scheduled == block_size
+
+
+@pytest.mark.parametrize("drafts,expected", [([1, 9, 2], [1, 9]), ([1, -1, -1], [1])])
+def test_sync_preserves_first_grammar_invalid_proposal(drafts, expected):
+    from types import SimpleNamespace
+
+    scheduler = Scheduler.__new__(Scheduler)
+    request = SimpleNamespace(
+        is_finished=lambda: False,
+        is_prefill_chunk=False,
+        use_structured_output=True,
+        spec_token_ids=[],
+        structured_output_request=SimpleNamespace(
+            grammar=SimpleNamespace(
+                is_terminated=lambda: False, validate_tokens=lambda tokens: tokens[:1]
+            )
+        ),
+    )
+    scheduler.requests = {"r": request}
+    scheduler.structured_output_manager = SimpleNamespace(should_advance=lambda r: True)
+    scheduler.update_draft_token_ids(DraftTokenIds(["r"], [drafts]))
+    assert request.spec_token_ids == expected
+
+
+def test_async_preserves_grammar_invalid_proposals():
+    from types import SimpleNamespace
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.requests = {"r": SimpleNamespace(is_finished=lambda: False)}
+    output = SimpleNamespace(scheduled_spec_decode_tokens={"r": [-1, -1, -1]})
+    scheduler.update_draft_token_ids_in_output(
+        DraftTokenIds(["r"], [[1, 9, 2]]), output
+    )
+    assert output.scheduled_spec_decode_tokens["r"] == [1, 9, 2]
+    assert output.num_invalid_spec_tokens == {}
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])

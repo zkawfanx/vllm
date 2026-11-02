@@ -1010,3 +1010,74 @@ def test_online_quantize_reload(
         mul_perp = llm.generate_prompt_perplexity(["3 4 = 12"], mask=["3 4 ="])[0]
         add_perp = llm.generate_prompt_perplexity(["3 4 = 7"], mask=["3 4 ="])[0]
         assert add_perp < mul_perp
+
+
+@pytest.mark.parametrize("backend", ["nvidia", "amd"])
+@pytest.mark.parametrize("draft", [False, True])
+@pytest.mark.parametrize("tp_rank", [0, 1])
+@pytest.mark.parametrize("padding", [0, 2])
+def test_deepseek_v41_sink_reload_preserves_kernel_storage(
+    monkeypatch, backend, draft, tp_rank, padding
+):
+    """Reload sink values through the current loader, retaining kernel storage."""
+    from importlib import import_module
+    from types import SimpleNamespace
+
+    from vllm.model_executor.model_loader import weight_utils
+
+    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(weight_utils, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    module = import_module(
+        f"vllm.models.deepseek_v4_1.{backend}.{'dspark' if draft else 'model'}"
+    )
+    cls = module.DSparkDeepseekV4ForCausalLM if draft else module.DeepseekV4Model
+    model = cls.__new__(cls)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(num_attention_heads=8, n_routed_experts=0)
+    model.quant_config = None
+    model.use_sequence_parallel = False
+    model.pad_shared_expert = False
+    layer = torch.nn.Module()
+    layer.attn = torch.nn.Module()
+    layer.attn.attn_sink = weight_utils.make_attention_sink(4 + padding, torch.float32)
+    loaded = []
+
+    def sink_loader(param, weight):
+        if not param.is_meta:
+            loaded.append(weight)
+        weight_utils.load_attention_sink(param, weight)
+
+    layer.attn.attn_sink.weight_loader = sink_loader
+    if draft:
+        model.model = torch.nn.Module()
+        model.model.confidence_head = None
+        model.model.layers = torch.nn.ModuleList([layer])
+        layer.ffn = SimpleNamespace(use_mega_moe=False)
+        monkeypatch.setattr(
+            module, "fused_moe_make_expert_params_mapping", lambda *a, **k: []
+        )
+        model.process_weights_after_loading = lambda: None
+        checkpoint_name = "mtp.0.attn.attn_sink"
+        loaded_name = "model.layers.0.attn.attn_sink"
+    else:
+        model.layers = torch.nn.ModuleList([layer])
+        model.get_expert_mapping = lambda: []
+        monkeypatch.setattr(module, "is_pp_missing_parameter", lambda *a: False)
+        checkpoint_name = loaded_name = "layers.0.attn.attn_sink"
+
+    kernel_sink = layer.attn.attn_sink
+    for offset in (0, 10, 20):
+        if offset:
+            initialize_layerwise_reload(model)
+        checkpoint = torch.arange(8, dtype=torch.float32) + offset
+        loaded.clear()
+        assert model.load_weights([(checkpoint_name, checkpoint)]) == {loaded_name}
+        if offset:
+            finalize_layerwise_reload(model, SimpleNamespace(dtype=torch.float32))
+        assert len(loaded) == 1
+        assert torch.equal(loaded[0], checkpoint)
+        assert torch.equal(kernel_sink[:4], checkpoint.chunk(2)[tp_rank])
+        assert torch.isneginf(kernel_sink[4:]).all()
+        assert layer.attn.attn_sink.data_ptr() == kernel_sink.data_ptr()
+        if not offset:
+            record_metadata_for_reloading(model)

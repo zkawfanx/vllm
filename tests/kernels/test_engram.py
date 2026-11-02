@@ -469,3 +469,21 @@ def test_engram_consumer_completes_only_its_layer_on_shared_stream(monkeypatch):
     torch.testing.assert_close(rows.squeeze(-1), first)
     assert (modules[1].staged_rows == -1).all()
     assert len(work) == 1
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.accelerator.is_available(),
+    reason="CUDA required",
+)
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_engram_profile_dead_rows_ignore_table(cpu_offload):
+    """Profile hashes must yield zeros even when table contents are unusable."""
+    layer = _make_embedding(cpu_offload)
+    layer.weight.fill_(float("nan"))
+    layer.weight_scale_inv.fill_(255)
+    hashes = torch.full((5, 2, 24), -1, dtype=torch.int32, device="cuda")
+    rows = torch.full(
+        (5, 24, layer.dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    layer.lookup(hashes[:, 1], rows)
+    torch.testing.assert_close(rows, torch.zeros_like(rows))
