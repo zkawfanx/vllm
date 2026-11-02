@@ -102,6 +102,73 @@ def test_instanttensor_cpu_only_checkpoint(mock_instanttensor, tmp_path, name):
 
 
 @pytest.mark.parametrize("cpu_offload", [False, True])
+@pytest.mark.parametrize("local_ids", [None, set(), {0}, {0, 1}])
+def test_instanttensor_ep_filter(mock_instanttensor, tmp_path, cpu_offload, local_ids):
+    native_open, group = mock_instanttensor
+    weights = {
+        "mlp.experts.0.gate_proj.weight": torch.ones(2),
+        "mlp.experts.1.gate_proj.weight": torch.ones(2),
+        "mlp.experts.1.gate_proj.weight_scale": torch.ones(1),
+        "mlp.experts.gate_proj.weight": torch.ones(2),
+        "mlp.shared_experts.gate_proj.weight": torch.ones(2),
+        "layers[0].attn.weight": torch.ones(2),
+        "layers.0.engram.embed.weight": torch.ones(2),
+    }
+    path = tmp_path / "model.safetensors"
+    save_file(weights, path)
+    expected = dict(weights)
+    if local_ids is not None:
+        for expert in {0, 1} - local_ids:
+            del expected[f"mlp.experts.{expert}.gate_proj.weight"]
+    gpu_names = set(expected)
+    if cpu_offload:
+        gpu_names.remove("layers.0.engram.embed.weight")
+    reader = native_open.return_value.__enter__.return_value
+    reader.tensors.return_value = ((name, weights[name]) for name in gpu_names)
+    loaded = dict(
+        instanttensor_weights_iterator(
+            [str(path)],
+            False,
+            load_engram_on_cpu=cpu_offload,
+            local_expert_ids=local_ids,
+        )
+    )
+    kwargs = native_open.call_args.kwargs
+    filtered = cpu_offload or local_ids is not None
+    assert kwargs["process_group"] is (None if filtered else group.device_group)
+    if filtered:
+        assert set(kwargs["tensor_filter"]) == gpu_names
+        assert kwargs["tensor_name_match_mode"] == "exact"
+    else:
+        assert "tensor_filter" not in kwargs
+    assert loaded.keys() == expected.keys()
+
+
+@pytest.mark.parametrize("local_ids", [set(), {0}])
+def test_instanttensor_ep_fused_checkpoint_keeps_collective(
+    mock_instanttensor, tmp_path, local_ids
+):
+    native_open, group = mock_instanttensor
+    path = tmp_path / "model.safetensors"
+    save_file({"mlp.experts.gate_proj.weight": torch.ones(2)}, path)
+    list(instanttensor_weights_iterator([str(path)], False, local_expert_ids=local_ids))
+    kwargs = native_open.call_args.kwargs
+    assert kwargs["process_group"] is group.device_group
+    assert "tensor_filter" not in kwargs
+
+
+def test_instanttensor_ep_empty_selection_skips_native(mock_instanttensor, tmp_path):
+    native_open, _ = mock_instanttensor
+    path = tmp_path / "model.safetensors"
+    save_file({"mlp.experts.0.gate_proj.weight": torch.ones(2)}, path)
+    assert (
+        list(instanttensor_weights_iterator([str(path)], False, local_expert_ids=set()))
+        == []
+    )
+    native_open.assert_not_called()
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
 def test_instanttensor_no_engram_keeps_collective(
     mock_instanttensor, tmp_path, monkeypatch, cpu_offload
 ):
@@ -159,19 +226,25 @@ def test_instanttensor_loader_config(
     iterator = MagicMock(return_value=iter(()))
     monkeypatch.setattr(default_loader, "instanttensor_weights_iterator", iterator)
     loader = default_loader.DefaultModelLoader(LoadConfig(load_format="instanttensor"))
+    loader.local_expert_ids = {1, 3}
     monkeypatch.setattr(
         loader, "_prepare_weights", lambda *args: ("", ["model.safetensors"], True)
     )
     list(loader._get_weights_iterator(loader.Source("model", None)))
     assert iterator.call_args.kwargs["load_engram_on_cpu"] is expected
+    assert iterator.call_args.kwargs["local_expert_ids"] == {1, 3}
 
 
 @pytest.mark.skipif(
     not current_platform.is_cuda(), reason="InstantTensor requires NVIDIA GPUs"
 )
 @pytest.mark.parametrize("cpu_offload", [False, True])
-def test_instanttensor_engram_cuda(tmp_path, cpu_offload):
+@pytest.mark.parametrize("local_ids", [None, {0}])
+def test_instanttensor_engram_cuda(tmp_path, cpu_offload, local_ids):
     weights = {
+        "mlp.experts.0.gate_proj.weight": torch.ones(2),
+        "mlp.experts.1.gate_proj.weight": torch.ones(2),
+        "mlp.experts.1.gate_proj.weight_scale": torch.ones(1),
         "layers[1].engram.wkv.weight": torch.ones(2),
         "layers.1.engram.embed.weight": torch.arange(8)
         .reshape(4, 2)
@@ -184,9 +257,14 @@ def test_instanttensor_engram_cuda(tmp_path, cpu_offload):
     save_file(weights, path)
     loaded = dict(
         instanttensor_weights_iterator(
-            [str(path)], False, load_engram_on_cpu=cpu_offload
+            [str(path)],
+            False,
+            load_engram_on_cpu=cpu_offload,
+            local_expert_ids=local_ids,
         )
     )
+    if local_ids is not None:
+        del weights["mlp.experts.1.gate_proj.weight"]
     assert loaded.keys() == weights.keys()
     for name, tensor in loaded.items():
         cpu_table = cpu_offload and ".embed." in name
