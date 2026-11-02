@@ -5129,6 +5129,43 @@ def test_eagle3_mm_encoder_cache_with_shift():
     )
 
 
+@pytest.mark.parametrize("already_running", [False, True])
+def test_repeated_encoder_input_stays_pinned_across_prefill_chunks(already_running):
+    scheduler = create_scheduler(
+        model="llava-hf/llava-1.5-7b-hf", max_num_batched_tokens=24
+    )
+    offset = 24 if already_running else 0
+    request = create_requests(
+        num_requests=1,
+        num_tokens=64,
+        mm_hashes_list=[["image", "image"]],
+        mm_positions=[
+            [
+                PlaceholderRange(offset=offset, length=16),
+                PlaceholderRange(offset=offset + 16, length=16),
+            ]
+        ],
+    )[0]
+    scheduler.add_request(request)
+    if already_running:
+        scheduler.schedule()
+    output = scheduler.schedule()
+    manager = scheduler.encoder_cache_manager
+
+    assert output.scheduled_encoder_inputs[request.request_id] == [0]
+    assert manager.get_cached_input_ids(request) == {0, 1}
+    assert manager.request_hash_refs[request.request_id] == {"image": 2}
+    request.num_computed_tokens = offset + 24
+    scheduler._free_encoder_inputs(request)
+    assert manager.get_cached_input_ids(request) == {1}
+    assert "image" not in manager.freeable
+
+    request.num_computed_tokens = offset + 32
+    scheduler._free_encoder_inputs(request)
+    assert manager.get_cached_input_ids(request) == set()
+    assert manager.freeable["image"] == 16
+
+
 def test_free_encoder_inputs_respects_unconfirmed_placeholders():
     """Regression test for issue #38551 (rollback path): under async
     scheduling with speculative decoding, num_computed_tokens is advanced
