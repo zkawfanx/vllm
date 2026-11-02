@@ -66,8 +66,11 @@ def should_skip_weight(
     local_expert_ids: set[int] | None,
 ) -> bool:
     """Return ``True`` if *weight_name* is an expert weight that does not
-    belong to the local rank and should be skipped during loading."""
-    if local_expert_ids is None:
+    belong to the local rank and should be skipped during loading.
+
+    MTP weights use the draft model's independent expert partition.
+    """
+    if local_expert_ids is None or weight_name.startswith("mtp."):
         return False
     eid = parse_expert_id(weight_name)
     if eid is None:
