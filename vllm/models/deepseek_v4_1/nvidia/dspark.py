@@ -423,6 +423,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
             ("attn.fused_wqa_wkv", "attn.wkv", 1),
         ]
 
+        weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         loaded_confidence_head = False
@@ -433,7 +435,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         head_start = n_local_head * tp_rank
         head_end = n_local_head * (tp_rank + 1)
 
-        weights = _duplicate_context_wkv_weights(weights, len(self.model.layers))
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_name(name)
             if mapped is None:
@@ -564,3 +565,4 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         ):
             return f"model.{rest}"
         return f"model.layers.{stage}.{rest}"
+
