@@ -216,4 +216,3 @@ def test_pipeline_loads_only_local_engram_projection(monkeypatch, owned_layer):
         name = f"layers.{owned_layer}.engram.wkv.weight"
         assert loaded == {name}
         torch.testing.assert_close(layer.engram.wkv.weight, weights[name][4:])
-
