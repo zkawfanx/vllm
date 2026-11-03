@@ -271,7 +271,7 @@ def test_engram_profile_stages_dead_rows(
     model_module = import_module(f"vllm.models.deepseek_v4_1.{backend}.model")
     tokens, layers, heads = 5, 2, 6
     hashes = torch.ones(tokens, layers, heads, dtype=torch.int32)
-    staged = []
+    staged: list[torch.Tensor] = []
 
     class StopAtDecoder(Exception):
         pass
@@ -336,4 +336,53 @@ def test_engram_profile_stages_dead_rows(
             None,
             inputs_embeds=torch.ones(tokens, 4, 8),
             lookback_token_ids=torch.zeros(1, 3, dtype=torch.int64),
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("redundant", [0, 6])
+@pytest.mark.parametrize("lora_prefix", ["", "base_layer."])
+def test_expert_mapping_index_preserves_checkpoint_matches(redundant, lora_prefix):
+    """Indexing must preserve shard order, replicas, scales and unusual paths."""
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+    from vllm.models.deepseek_v4_1.nvidia.model import (
+        _expert_mapping_candidates,
+        _index_expert_mapping,
+    )
+
+    mapping = RoutedExperts.build_expert_params_mapping(
+        "w1",
+        "w2",
+        "w3",
+        num_experts=16,
+        num_redundant_experts=redundant,
+        lora_base_layer_prefix=lora_prefix,
+    )
+    indexed = _index_expert_mapping(mapping)
+    assert len(indexed) == 16
+    for prefix in ("layers.0.ffn.", "model.layers.2.ffn.", "experts.0.child."):
+        for expert in ("0", "1", "10", "15", "01", "16"):
+            for proj in ("w1", "w2", "w3"):
+                for suffix in (
+                    "weight",
+                    "weight_scale",
+                    "weight_scale_inv",
+                    "input_scale",
+                ):
+                    name = f"{prefix}experts.{expert}.{proj}.{lora_prefix}{suffix}"
+                    candidates = _expert_mapping_candidates(name, mapping, indexed)
+                    assert [m for m in candidates if m[1] in name] == [
+                        m for m in mapping if m[1] in name
+                    ]
+    for unsupported in ("experts.w13", "experts.1", "1.w1.", ""):
+        unusual = mapping + [("missing", unsupported, 1, "w1")]
+        assert not _index_expert_mapping(unusual)
+        assert (
+            _expert_mapping_candidates(
+                "layers.0.ffn.experts.1.w1.weight",
+                unusual,
+                _index_expert_mapping(unusual),
+            )
+            is unusual
         )
