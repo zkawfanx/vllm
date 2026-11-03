@@ -62,8 +62,14 @@ def _run_persistent(logits, lengths, k, max_len):
 def _run_decode(logits, lengths, k, max_len):
     out = torch.full((logits.shape[0], k), -1, dtype=torch.int32, device="cuda")
     ops.top_k_per_row_decode(
-        logits, 1, lengths, out, logits.shape[0],
-        logits.stride(0), logits.stride(1), k,
+        logits,
+        1,
+        lengths,
+        out,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        k,
     )
     return out
 
@@ -94,9 +100,9 @@ def test_persistent_topk_radix_graph_replay(k: int, rows: int):
     n = 65537
     logits = torch.stack([_make_logits("dup-vals", n, seed=r) for r in range(rows)])
     lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
-    expected = torch.stack([
-        torch.argsort(-row, stable=True)[:k].sort().values for row in logits
-    ]).to(torch.int32)
+    expected = torch.stack(
+        [torch.argsort(-row, stable=True)[:k].sort().values for row in logits]
+    ).to(torch.int32)
     out = torch.empty((rows, k), dtype=torch.int32, device="cuda")
     ws = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
