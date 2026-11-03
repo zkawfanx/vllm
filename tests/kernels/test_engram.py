@@ -176,6 +176,36 @@ def _reference_lookup(weight, scale_inv, ids, start, end, block=32):
     return values.masked_fill(mask.unsqueeze(-1), 0)
 
 
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_engram_meta_initialization_does_not_allocate_host_tables(
+    monkeypatch, cpu_offload
+):
+    """Encoder-only placeholders must not allocate pinned host storage."""
+    from vllm.models.deepseek_v4_1.common import engram
+
+    monkeypatch.setattr(engram, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(engram, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(engram, "is_uva_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _: SimpleNamespace(multi_processor_count=1),
+    )
+    with torch.device("meta"):
+        layer = ParallelEngramEmbedding(36, 64, (17, 19), cpu_offload=cpu_offload)
+
+    assert layer.weight.is_meta and layer.weight_scale_inv.is_meta
+    assert layer.weight.shape == (36, 64)
+    assert layer.weight_scale_inv.shape == (36, 2)
+    assert layer.weight.dtype == torch.float8_e4m3fn
+    assert layer.weight_scale_inv.dtype == torch.uint8
+    assert not hasattr(layer.weight, "dummy_weight_value")
+    assert not hasattr(layer.weight_scale_inv, "dummy_weight_value")
+
+
 def _make_embedding(cpu_offload, rows=4096, dim=256, block=32):
     layer = ParallelEngramEmbedding.__new__(ParallelEngramEmbedding)
     torch.nn.Module.__init__(layer)
@@ -469,3 +499,21 @@ def test_engram_consumer_completes_only_its_layer_on_shared_stream(monkeypatch):
     torch.testing.assert_close(rows.squeeze(-1), first)
     assert (modules[1].staged_rows == -1).all()
     assert len(work) == 1
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda() or not torch.accelerator.is_available(),
+    reason="CUDA required",
+)
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_engram_profile_dead_rows_ignore_table(cpu_offload):
+    """Profile hashes must yield zeros even when table contents are unusable."""
+    layer = _make_embedding(cpu_offload)
+    layer.weight.fill_(float("nan"))
+    layer.weight_scale_inv.fill_(255)
+    hashes = torch.full((5, 2, 24), -1, dtype=torch.int32, device="cuda")
+    rows = torch.full(
+        (5, 24, layer.dim), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    layer.lookup(hashes[:, 1], rows)
+    torch.testing.assert_close(rows, torch.zeros_like(rows))

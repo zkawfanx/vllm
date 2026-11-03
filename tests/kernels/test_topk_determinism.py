@@ -86,6 +86,35 @@ KERNELS = {
 
 
 @requires_cuda
+@pytest.mark.parametrize("k", [512, 1024, 2048])
+@pytest.mark.parametrize("rows", [1, 8, 32])
+@torch.inference_mode()
+def test_persistent_topk_radix_graph_replay(k: int, rows: int):
+    """All CTA histogram writes must precede inter-CTA arrival publication."""
+    n = 65537
+    logits = torch.stack([_make_logits("dup-vals", n, seed=r) for r in range(rows)])
+    lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
+    expected = torch.stack([
+        torch.argsort(-row, stable=True)[:k].sort().values for row in logits
+    ]).to(torch.int32)
+    out = torch.empty((rows, k), dtype=torch.int32, device="cuda")
+    ws = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        torch.ops._C.persistent_topk(logits, lengths, out, ws, k, n)
+    torch.cuda.current_stream().wait_stream(stream)
+    first = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        torch.ops._C.persistent_topk(logits, lengths, out, ws, k, n)
+    for _ in range(ITERS):
+        graph.replay()
+        torch.testing.assert_close(out.sort(dim=1).values, expected, rtol=0, atol=0)
+        torch.testing.assert_close(out, first, rtol=0, atol=0)
+
+
+@requires_cuda
 @pytest.mark.parametrize("kernel", KERNELS)
 @pytest.mark.parametrize("scenario", ["zeros-tie", "dup-vals", "unique"])
 @pytest.mark.parametrize("n", [6000, 16000, 60000])

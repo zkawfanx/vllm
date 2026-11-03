@@ -13,7 +13,6 @@ from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -81,6 +80,32 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+
+def _index_expert_mapping(
+    mapping: list[tuple[str, str, int, str]],
+) -> dict[str, list[tuple[str, str, int, str]]]:
+    """Index logical checkpoint IDs, retaining ordered physical replicas."""
+    indexed: dict[str, list[tuple[str, str, int, str]]] = {}
+    for entry in mapping:
+        prefix, _, suffix = entry[1].partition(".")
+        expert_key, sep, _ = suffix.partition(".")
+        if prefix != "experts" or not expert_key.isdecimal() or not sep:
+            return {}
+        indexed.setdefault(expert_key, []).append(entry)
+    return indexed
+
+
+def _expert_mapping_candidates(
+    name: str,
+    mapping: list[tuple[str, str, int, str]],
+    indexed: dict[str, list[tuple[str, str, int, str]]],
+) -> list[tuple[str, str, int, str]]:
+    # Ambiguous paths and unsupported mappings retain substring matching semantics.
+    if name.count("experts.") == 1:
+        expert_key = name.partition("experts.")[2].partition(".")[0]
+        return indexed.get(expert_key, mapping)
+    return mapping
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -585,8 +610,8 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
 
         # Engram n-gram hashes for the whole (flattened) batch, computed once
         # on the full token stream — before any sequence-parallel sharding —
-        # and consumed by the engram layers (1 and 14) below. Skipped on
-        # profile runs (KV cache unbound).
+        # and consumed by the engram layers (1 and 14) below. Profile runs
+        # (KV cache unbound) look up dead rows instead.
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
         if (
@@ -627,13 +652,14 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
-                # Schedule all Engram lookups before entering the decoder layers.
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
-                        engram.prepare_embeddings(
-                            engram_hashes[:, engram.layer_hash_index]
-                        )
+            else:
+                # The memory profile must include lookup, collective and WKV buffers.
+                engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+            # Schedule all Engram lookups before entering the decoder layers.
+            for layer in islice(self.layers, self.start_layer, self.end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.prepare_embeddings(engram_hashes[:, engram.layer_hash_index])
 
         full_num_tokens = positions.shape[0]
         if self.use_sequence_parallel:
@@ -726,16 +752,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # TP for attention
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        n_head = self.config.num_attention_heads
-        n_local_head = n_head // tp_size
-        head_rank_start = n_local_head * tp_rank
-        head_rank_end = n_local_head * (tp_rank + 1)
-
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
+        indexed_expert_mapping = _index_expert_mapping(expert_mapping)
 
         # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
         # block count so the standard loaders below slice it evenly (trailing
@@ -785,7 +804,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         and loaded_weight.dtype == torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
+                    for mapping in _expert_mapping_candidates(
+                        name, expert_mapping, indexed_expert_mapping
+                    ):
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -793,9 +814,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
                         param = params_dict[name_mapped]
-                        # We should ask the weight loader to return success or not
-                        # here since otherwise we may skip experts with other
-                        # available replicas.
+                        # One logical expert can have multiple local replicas.
                         weight_loader = typing.cast(
                             Callable[..., bool], param.weight_loader
                         )
@@ -808,17 +827,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                             return_success=True,
                         )
                         if success:
-                            name = name_mapped
-                            break
-                    loaded_params.add(name_mapped)
-                    continue
-                elif "attn_sink" in name:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
-                    loaded_params.add(name)
+                            loaded_params.add(name_mapped)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
@@ -879,6 +888,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
             num_experts=self.config.n_routed_experts,
+            num_redundant_experts=first_layer.ffn.n_redundant_experts,
         )
 
     def finalize_mega_moe_weights(self) -> None:
