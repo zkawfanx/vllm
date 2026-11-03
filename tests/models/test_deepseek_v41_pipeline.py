@@ -271,7 +271,7 @@ def test_engram_profile_stages_dead_rows(
     model_module = import_module(f"vllm.models.deepseek_v4_1.{backend}.model")
     tokens, layers, heads = 5, 2, 6
     hashes = torch.ones(tokens, layers, heads, dtype=torch.int32)
-    staged = []
+    staged: list[torch.Tensor] = []
 
     class StopAtDecoder(Exception):
         pass
