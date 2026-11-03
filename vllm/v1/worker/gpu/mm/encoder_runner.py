@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import gc
+
 import numpy as np
 import torch
 
+from vllm.config import VllmConfig
+from vllm.distributed.parallel_state import graph_capture
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import SupportsMultiModal, supports_realtime
+from vllm.model_executor.models.interfaces import (
+    SupportsMultiModal,
+    supports_encoder_cudagraph,
+    supports_realtime,
+)
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import MultiModalKwargsItem
 from vllm.multimodal.utils import (
@@ -12,6 +20,8 @@ from vllm.multimodal.utils import (
     group_and_batch_mm_kwargs,
     set_mm_embedding_modality,
 )
+from vllm.platforms import current_platform
+from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
@@ -27,6 +37,7 @@ class EncoderRunner:
         encoder_cache: EncoderCache,
         dtype: torch.dtype,
         device: torch.device,
+        vllm_config: VllmConfig | None = None,
     ):
         self.model = model
         self.max_num_tokens = max_num_tokens
@@ -35,10 +46,62 @@ class EncoderRunner:
         self.dtype = dtype
         self.device = device
         self.is_realtime = supports_realtime(model)
+        self.vllm_config = vllm_config
+        self.cudagraph_enabled = (
+            vllm_config is not None
+            and vllm_config.compilation_config.cudagraph_mm_encoder
+            and not vllm_config.model_config.enforce_eager
+            and supports_encoder_cudagraph(model)
+        )
+        self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.inputs_embeds = torch.zeros(
             max_num_tokens, hidden_size, dtype=dtype, device=device
         )
+
+    def _create_encoder_cudagraph_manager(self) -> EncoderCudaGraphManager:
+        assert self.vllm_config is not None
+        assert supports_encoder_cudagraph(self.model)
+        return EncoderCudaGraphManager(
+            vllm_config=self.vllm_config,
+            device=self.device,
+            dtype=self.dtype,
+            model=self.model,
+        )
+
+    @torch.inference_mode()
+    def profile_cudagraph_memory(self) -> int:
+        if not self.cudagraph_enabled:
+            return 0
+        manager = self._create_encoder_cudagraph_manager()
+        try:
+            with graph_capture(device=self.device):
+                torch.accelerator.synchronize()
+                torch.accelerator.empty_cache()
+                free_before = torch.accelerator.get_memory_info()[0]
+                manager.capture(graph_pool=current_platform.graph_pool_handle())
+                torch.accelerator.synchronize()
+                free_after = torch.accelerator.get_memory_info()[0]
+            return max(free_before - free_after, 0)
+        finally:
+            manager.clear()
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+    @torch.inference_mode()
+    def capture_model(self) -> None:
+        if not self.cudagraph_enabled or self.encoder_cudagraph_manager is not None:
+            return
+        manager = self._create_encoder_cudagraph_manager()
+        try:
+            with graph_capture(device=self.device):
+                manager.capture(graph_pool=current_platform.graph_pool_handle())
+                torch.accelerator.synchronize()
+        except Exception:
+            manager.clear()
+            raise
+        # Profiling stays eager; only completed serving captures enable replay.
+        self.encoder_cudagraph_manager = manager
 
     def prepare_mm_inputs(
         self, scheduled_encoder_inputs: dict[str, list[int]]
@@ -103,7 +166,11 @@ class EncoderRunner:
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs, device=self.device, pin_memory=True
         ):
-            batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
+            manager = self.encoder_cudagraph_manager
+            if manager is not None and manager.supports_modality(modality):
+                batch_outputs = manager.execute(mm_kwargs_batch)
+            else:
+                batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
             sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
             encoder_outputs.extend(batch_outputs)
         return encoder_outputs

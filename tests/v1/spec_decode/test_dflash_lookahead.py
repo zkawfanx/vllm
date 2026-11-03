@@ -50,7 +50,12 @@ def _dflash_speculative_config(num_speculative_tokens: int) -> SpeculativeConfig
     )
 
 
-def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
+def _create_dflash_scheduler(
+    num_speculative_tokens: int,
+    *,
+    data_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+) -> Scheduler:
     speculative_config = _dflash_speculative_config(num_speculative_tokens)
     model_config = speculative_config.target_model_config
     scheduler_config = SchedulerConfig(
@@ -69,7 +74,10 @@ def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,
-        parallel_config=ParallelConfig(),
+        parallel_config=ParallelConfig(
+            data_parallel_size=data_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+        ),
         speculative_config=speculative_config,
     )
     kv_cache_config = KVCacheConfig(
@@ -95,6 +103,35 @@ def _create_dflash_scheduler(num_speculative_tokens: int) -> Scheduler:
         log_stats=True,
         structured_output_manager=StructuredOutputManager(vllm_config),
     )
+
+
+@pytest.mark.parametrize(
+    "use_v2,dp,pp,skip_drafts",
+    [
+        (True, 1, 1, True),
+        (False, 1, 1, False),
+        (True, 2, 1, False),
+        (True, 1, 2, False),
+    ],
+)
+def test_skip_drafts_requires_dp1_pp1_v2_scheduling(
+    monkeypatch, use_v2, dp, pp, skip_drafts
+):
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", str(int(use_v2)))
+    scheduler = _create_dflash_scheduler(
+        NUM_SPECULATIVE_TOKENS,
+        data_parallel_size=dp,
+        pipeline_parallel_size=pp,
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=BLOCK_SIZE, max_tokens=1)
+    scheduler.add_request(request)
+
+    output = scheduler.schedule()
+
+    assert output.skip_drafts is skip_drafts
+    # Skipping queries must not change the drafter's KV allocation contract.
+    assert scheduler.num_lookahead_tokens == NUM_SPECULATIVE_TOKENS + 1
+    assert len(output.scheduled_new_reqs[0].block_ids[0]) == 2
 
 
 def test_dflash_prefill_reserves_lookahead_blocks():
