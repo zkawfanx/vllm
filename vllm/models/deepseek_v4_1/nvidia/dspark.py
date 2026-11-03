@@ -560,4 +560,3 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         ):
             return f"model.{rest}"
         return f"model.layers.{stage}.{rest}"
-

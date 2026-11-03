@@ -160,8 +160,6 @@ def test_v41_context_wkv_loads_weights_and_scales_into_both_projections(
 
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 3)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 4)
-    monkeypatch.setattr(dspark, "get_tensor_model_parallel_rank", lambda: 3)
-    monkeypatch.setattr(dspark, "get_tensor_model_parallel_world_size", lambda: 4)
     monkeypatch.setattr(
         dspark, "fused_moe_make_expert_params_mapping", lambda *a, **k: []
     )
@@ -273,6 +271,7 @@ def test_v41_context_kv_stacked_projection_preserves_layer_outputs(
     for (attn, kv, pos, slots), i in zip(inserted, (0, 2)):
         assert attn is layers[i].attn
         torch.testing.assert_close(kv, x @ weights[i].T)
+        assert mappings is not None
         assert pos is positions and slots is mappings[i]
 
 
@@ -296,8 +295,8 @@ def test_v41_context_projection_rejects_incompatible_quantization(
         pass
 
     quant_config = object()
-    context_method = QuantMethod(quant_config)
-    query_methods = [QuantMethod(quant_config), QuantMethod(quant_config)]
+    context_method: object = QuantMethod(quant_config)
+    query_methods: list[object] = [QuantMethod(quant_config), QuantMethod(quant_config)]
     if mismatch == "unquantized":
         context_method = object()
         query_methods = [object(), object()]
