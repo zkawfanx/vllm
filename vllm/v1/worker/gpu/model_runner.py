@@ -1261,6 +1261,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.free_states(scheduler_output)
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
+            if self.encoder_cache is not None:
+                # add_requests initializes RoPE positions from CPU metadata first.
+                for req_id, updates in scheduler_output.encoder_input_updates.items():
+                    self.encoder_cache.update_encoder_inputs(req_id, updates)
             self.block_tables.apply_staged_writes()
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
@@ -1485,6 +1489,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             hidden_states=hidden_states,
             aux_hidden_states=aux_hidden_states,
             finished_req_ids=finished_req_ids,
+            skip_drafts=scheduler_output.skip_drafts,
         )
 
         if not self.is_last_pp_rank:
@@ -1507,6 +1512,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         hidden_states = self.execute_model_state.hidden_states
         aux_hidden_states = self.execute_model_state.aux_hidden_states
         finished_req_ids = self.execute_model_state.finished_req_ids
+        num_drafts = (
+            0 if self.execute_model_state.skip_drafts else self.num_speculative_steps
+        )
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -1622,7 +1630,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
                 mm_inputs=mm_inputs,
+                num_speculative_tokens=num_drafts,
             )
+            if num_drafts == 0:
+                draft_tokens.fill_(-1)
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
 
         if self.num_speculative_steps > 0:
@@ -1630,7 +1641,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # not have a speculator (i.e. self.speculator is None)
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                self.req_states.draft_tokens[input_batch.idx_mapping, :num_drafts],
             )
 
         # Post-step KV connector related operations.
@@ -1752,6 +1763,7 @@ class ExecuteModelState(NamedTuple):
     hidden_states: torch.Tensor | None
     aux_hidden_states: list[torch.Tensor] | None
     finished_req_ids: set[str]
+    skip_drafts: bool = False
 
 
 def sort_batch_req_ids(

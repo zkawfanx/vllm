@@ -13,7 +13,6 @@ from vllm.config import VllmConfig
 from vllm.config.kernel import MEGA_MOE_BACKENDS
 from vllm.distributed import (
     get_pp_group,
-    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from vllm.forward_context import get_forward_context, is_forward_context_available
@@ -81,6 +80,32 @@ if typing.TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
 
 logger = init_logger(__name__)
+
+
+def _index_expert_mapping(
+    mapping: list[tuple[str, str, int, str]],
+) -> dict[str, list[tuple[str, str, int, str]]]:
+    """Index logical checkpoint IDs, retaining ordered physical replicas."""
+    indexed: dict[str, list[tuple[str, str, int, str]]] = {}
+    for entry in mapping:
+        prefix, _, suffix = entry[1].partition(".")
+        expert_key, sep, _ = suffix.partition(".")
+        if prefix != "experts" or not expert_key.isdecimal() or not sep:
+            return {}
+        indexed.setdefault(expert_key, []).append(entry)
+    return indexed
+
+
+def _expert_mapping_candidates(
+    name: str,
+    mapping: list[tuple[str, str, int, str]],
+    indexed: dict[str, list[tuple[str, str, int, str]]],
+) -> list[tuple[str, str, int, str]]:
+    # Ambiguous paths and unsupported mappings retain substring matching semantics.
+    if name.count("experts.") == 1:
+        expert_key = name.partition("experts.")[2].partition(".")[0]
+        return indexed.get(expert_key, mapping)
+    return mapping
 
 
 class DeepseekV4MoE(DeepseekV4MoEBase):
@@ -727,16 +752,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
 
-        # TP for attention
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        n_head = self.config.num_attention_heads
-        n_local_head = n_head // tp_size
-        head_rank_start = n_local_head * tp_rank
-        head_rank_end = n_local_head * (tp_rank + 1)
-
         # Pre-compute expert mapping ONCE.
         expert_mapping = self.get_expert_mapping()
+        indexed_expert_mapping = _index_expert_mapping(expert_mapping)
 
         # Block-FP8 shared experts: pad the intermediate up to the TP-uniform
         # block count so the standard loaders below slice it evenly (trailing
@@ -786,7 +804,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         and loaded_weight.dtype == torch.float8_e8m0fnu
                     ):
                         loaded_weight = loaded_weight.view(torch.uint8)
-                    for mapping in expert_mapping:
+                    for mapping in _expert_mapping_candidates(
+                        name, expert_mapping, indexed_expert_mapping
+                    ):
                         param_name, weight_name, expert_id, expert_shard_id = mapping
                         if weight_name not in name:
                             continue
@@ -808,14 +828,6 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                         )
                         if success:
                             loaded_params.add(name_mapped)
-                    continue
-                elif "attn_sink" in name:
-                    if is_pp_missing_parameter(name, self):
-                        continue
-                    narrow_weight = loaded_weight[head_rank_start:head_rank_end]
-                    n = narrow_weight.shape[0]
-                    params_dict[name][:n].copy_(narrow_weight)
-                    loaded_params.add(name)
                     continue
                 else:
                     if is_pp_missing_parameter(name, self):
