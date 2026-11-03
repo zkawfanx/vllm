@@ -18,10 +18,6 @@ import torch.nn as nn
 
 import vllm.envs as envs
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import (
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
@@ -53,6 +49,8 @@ from vllm.models.common.ops.sequence_parallel import (
 from .model import (
     DeepseekV4DecoderLayer,
     DeepseekV4Model,
+    _expert_mapping_candidates,
+    _index_expert_mapping,
     _linear_scale_param_name,
     _use_sequence_parallel,
     make_deepseek_v4_expert_params_mapping,
@@ -361,6 +359,7 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 ckpt_up_proj_name="w3",
                 num_experts=n_draft_experts,
             )
+        indexed_expert_mapping = _index_expert_mapping(expert_mapping)
         expert_scale_suffix = (
             ".weight_scale"
             if getattr(self.config, "expert_dtype", "fp4") == "fp4"
@@ -378,12 +377,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         loaded_confidence_head = False
-
-        tp_size = get_tensor_model_parallel_world_size()
-        tp_rank = get_tensor_model_parallel_rank()
-        n_local_head = self.config.num_attention_heads // tp_size
-        head_start = n_local_head * tp_rank
-        head_end = n_local_head * (tp_rank + 1)
 
         for name, loaded_weight in weights:
             mapped = self._remap_dspark_name(name)
@@ -415,7 +408,14 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                     and loaded_weight.dtype == torch.float8_e8m0fnu
                 ):
                     loaded_weight = loaded_weight.view(torch.uint8)
-                for param_name, weight_name, expert_id, shard_id in expert_mapping:
+                for (
+                    param_name,
+                    weight_name,
+                    expert_id,
+                    shard_id,
+                ) in _expert_mapping_candidates(
+                    name, expert_mapping, indexed_expert_mapping
+                ):
                     if weight_name not in name:
                         continue
                     name_mapped = name.replace(weight_name, param_name)
@@ -446,11 +446,6 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
                 loaded_params.add(name)
                 break
             else:
-                if "attn_sink" in name:
-                    narrow = loaded_weight[head_start:head_end]
-                    params_dict[name][: narrow.shape[0]].copy_(narrow)
-                    loaded_params.add(name)
-                    continue
                 if name.endswith(".ffn.gate.bias"):
                     name = name.replace(
                         ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"

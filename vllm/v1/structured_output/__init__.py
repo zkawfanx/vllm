@@ -357,13 +357,17 @@ class StructuredOutputManager:
                 history_len = 0
 
                 state_advancements = 0
-                post_reasoning_end_in_window = False
+                padding_or_invalid = False
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
                 for i, token in enumerate(req_tokens):
+                    if padding_or_invalid:
+                        self._fill_bitmasks(((grammar, cumulative_index, False),))
+                        cumulative_index += 1
+                        continue
                     self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
                     advance_grammar = apply_bitmask
                     if token == -1:
-                        apply_bitmask = False
+                        padding_or_invalid = True
                         advance_grammar = False
                     elif (
                         detect_reasoning_end
@@ -376,39 +380,23 @@ class StructuredOutputManager:
                             simulated_buf = history + list(req_tokens)
                         simulated = simulated_buf[: history_len + i + 1]
                         if reasoner.is_reasoning_end_streaming(simulated, [token]):
-                            # Reasoning ended mid-window. Constrain the rest
-                            # of the window via bitmask. Skip grammar advance
-                            # through the marker (it is reasoning content);
-                            # try to advance through subsequent drafts so the
-                            # next bitmask row reflects the post-advance state,
-                            # but tolerate rejection since those drafts predate
-                            # the bitmask and are not guaranteed valid.
+                            # The reasoning-end marker is not grammar content.
                             apply_bitmask = True
                             advance_grammar = False
-                            post_reasoning_end_in_window = True
-                    if advance_grammar and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        if accepted:
+                    if advance_grammar:
+                        if not grammar.is_terminated() and grammar.accept_tokens(
+                            req_id, [token]
+                        ):
                             state_advancements += 1
-                        elif not post_reasoning_end_in_window:
-                            raise AssertionError(
-                                (token, req_id, scheduled_spec_decode_tokens)
-                            )
+                        else:
+                            padding_or_invalid = True
                     cumulative_index += 1
                 # Diffusion LLMs don't sample a bonus token after the
                 # scheduled positions, so skip its bitmask in that case.
                 if not (self.vllm_config.model_config.is_diffusion and req_tokens):
-                    # bonus_apply must be True when the bonus-row position
-                    # should be grammar-constrained. Two triggers:
-                    # - should_fill_bitmask(request): reasoning was already
-                    #   over at step start (or no reasoner /
-                    #   enable_in_reasoning).
-                    # - apply_bitmask: reasoning ended mid-window in this
-                    #   call and was flipped True after the marker;
-                    #   should_fill_bitmask still returns False here because
-                    #   reasoning_ended is only persisted later by
-                    #   should_advance.
-                    bonus_apply = self.should_fill_bitmask(request) or apply_bitmask
+                    bonus_apply = not padding_or_invalid and (
+                        self.should_fill_bitmask(request) or apply_bitmask
+                    )
                     self._fill_bitmasks(((grammar, cumulative_index, bonus_apply),))
                     cumulative_index += 1
                 if state_advancements > 0:
