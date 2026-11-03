@@ -359,3 +359,21 @@ class TestEpFilterOnSyntheticMoeWeights:
 
         for name, tensor in filtered.items():
             assert torch.equal(tensor, all_weights[name]), f"Tensor mismatch for {name}"
+
+    def test_backbone_filter_retains_independently_partitioned_mtp_expert(
+        self, synthetic_moe_files
+    ):
+        """A smaller draft partition needs experts outside the backbone partition."""
+        from safetensors.torch import save_file
+
+        files, tensors = synthetic_moe_files
+        draft_name = "mtp.0.ffn.experts.2.w1.weight"
+        tensors[draft_name] = torch.arange(4).reshape(2, 2)
+        save_file(tensors, files[0])
+        local_ids = compute_local_expert_ids(8, ep_size=2, ep_rank=1)
+        loaded = dict(
+            safetensors_weights_iterator(files, False, local_expert_ids=local_ids)
+        )
+
+        assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in loaded
+        assert torch.equal(loaded[draft_name], tensors[draft_name])
