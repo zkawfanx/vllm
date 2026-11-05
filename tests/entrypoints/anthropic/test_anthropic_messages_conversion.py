@@ -13,6 +13,7 @@ Also covers cache usage computation in ``_build_anthropic_usage``.
 """
 
 import json
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -333,7 +334,7 @@ class TestToolResultContent:
     @pytest.mark.parametrize("mixed", [False, True], ids=["references", "mixed"])
     def test_tool_references_stay_in_one_result(self, tool_use_id, mixed):
         """References lead text, with images following the single tool message."""
-        content = [
+        content: list[dict[str, Any]] = [
             {"type": "tool_reference", "tool_name": "get_weather"},
             {"type": "tool_reference", "name": "get_time"},
         ]

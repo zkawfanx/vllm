@@ -4,12 +4,12 @@
 import asyncio
 import copy
 import json
-import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+import regex as re
 
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.chat_utils import BaseMultiModalItemTracker
