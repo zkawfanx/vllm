@@ -149,8 +149,10 @@ def test_decorator_passthrough_returns_fn_result(
     assert f() is sentinel
 
 
+@pytest.mark.parametrize("set_env_after_decoration", [False, True])
 def test_decorator_breaks_when_enabled_after_decoration(
     monkeypatch: pytest.MonkeyPatch,
+    set_env_after_decoration: bool,
 ):
     """VllmConfig can enable breakable cudagraphs after the decorated module
     was imported (e.g. on a cold model-info cache); the op must still break."""
@@ -165,7 +167,8 @@ def test_decorator_breaks_when_enabled_after_decoration(
     def op(x):
         return x + 1
 
-    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+    if set_env_after_decoration:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
 
     class _Capture:
         _capturing = True
@@ -235,6 +238,84 @@ def test_current_is_none_when_inactive():
 
     assert BreakableCUDAGraphCapture.current() is None
     assert BreakableCUDAGraphCapture.is_active() is False
+
+
+@pytest.mark.parametrize("resolved", [None, False, True])
+@pytest.mark.parametrize("env_enabled", [False, True])
+def test_breakable_cudagraph_reader_prefers_resolved_config(
+    monkeypatch, resolved, env_enabled
+):
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    from vllm.config import CompilationConfig
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(env_enabled)))
+    config = CompilationConfig(use_breakable_cudagraph=resolved)
+    expected = env_enabled if resolved is None else resolved
+    assert is_breakable_cudagraph_enabled(config) is expected
+    assert is_breakable_cudagraph_enabled() is env_enabled
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_breakable_cudagraph_dispatch_uses_resolved_config(monkeypatch, enabled):
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            use_breakable_cudagraph=enabled,
+        ),
+        num_speculative_tokens=0,
+        lora_config=None,
+    )
+    if enabled:
+        CudagraphDispatcher(config)
+    else:
+        with pytest.raises(AssertionError, match="Compilation mode"):
+            CudagraphDispatcher(config)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "graph_mode,has_piecewise",
+    [
+        ("NONE", False),
+        ("PIECEWISE", True),
+        ("FULL", False),
+        ("FULL_AND_PIECEWISE", True),
+    ],
+)
+def test_breakable_cudagraph_manager_uses_resolved_config(
+    monkeypatch, enabled, graph_mode, has_piecewise
+):
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationConfig, CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    mode = CUDAGraphMode[graph_mode]
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(use_breakable_cudagraph=enabled),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=1),
+    )
+
+    manager = cudagraph_utils.CudaGraphManager(config, torch.device("cpu"), mode, 1)
+
+    assert manager.use_breakable_cg is (enabled and has_piecewise)
 
 
 def test_thread_local_active_during_context(cuda_capture_stream):
