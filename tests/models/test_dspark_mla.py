@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
+from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
@@ -227,6 +229,97 @@ def test_v41_context_wkv_loads_weights_and_scales_into_both_projections(
             torch.tensor([-1.0, i + 0.5, i + 0.5])[:, None].expand(3, 5),
         )
     assert all(not hasattr(weight, "shard_id") for _, weight in checkpoint)
+
+
+@pytest.fixture(params=["nvidia", "amd"])
+def v41_confidence_loader(request, monkeypatch):
+    dspark = import_module(f"vllm.models.deepseek_v4_1.{request.param}.dspark")
+    draft = object.__new__(dspark.DSparkDeepseekV4ForCausalLM)
+    nn.Module.__init__(draft)
+    draft.config = SimpleNamespace(n_routed_experts=1)
+    draft.pad_shared_expert = False
+    draft.model = nn.Module()
+    draft.model.layers = [SimpleNamespace(ffn=SimpleNamespace(use_mega_moe=False))]
+    draft.model.norm = nn.Linear(2, 1, bias=False)
+    draft.model.confidence_head = nn.Module()
+    draft.model.confidence_head.proj = nn.Linear(2, 1, bias=False)
+    monkeypatch.setattr(
+        dspark, "fused_moe_make_expert_params_mapping", lambda *a, **k: []
+    )
+    # Exercise the loader and remapper without constructing/finalizing MoE.
+    monkeypatch.setattr(draft, "process_weights_after_loading", lambda: None)
+    return draft
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("empty_first_bucket", [False, True])
+def test_v41_confidence_survives_split_load(v41_confidence_loader, empty_first_bucket):
+    from vllm.model_executor.model_loader.mtp_validation import (
+        disable_mtp_completeness_check,
+    )
+
+    draft = v41_confidence_loader
+    head = draft.model.confidence_head
+    param = head.proj.weight
+    pointer = param.data_ptr()
+    norm = torch.full((1, 2), 2.0)
+    confidence = torch.full_like(param, 3.0)
+    first_bucket = [] if empty_first_bucket else [("mtp.2.norm.weight", norm)]
+    with disable_mtp_completeness_check():
+        assert draft.load_weights(iter(first_bucket)) == (
+            set() if empty_first_bucket else {"model.norm.weight"}
+        )
+        assert draft.model.confidence_head is head
+        assert draft.load_weights(
+            iter([("mtp.2.confidence_head.proj.weight", confidence)])
+        ) == {"model.confidence_head.proj.weight"}
+        assert draft.load_weights(iter([])) == set()
+    assert draft.model.confidence_head is head
+    assert head.proj.weight is param and param.data_ptr() == pointer
+    torch.testing.assert_close(param, confidence)
+    if not empty_first_bucket:
+        torch.testing.assert_close(draft.model.norm.weight, norm)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("include_confidence", [False, True])
+def test_v41_confidence_complete_checkpoint(v41_confidence_loader, include_confidence):
+    draft = v41_confidence_loader
+    head = draft.model.confidence_head
+    value = torch.full((1, 2), 4.0)
+    checkpoint = [("mtp.2.norm.weight", value)]
+    expected = {"model.norm.weight"}
+    if include_confidence:
+        checkpoint.append(("mtp.2.confidence_head.proj.weight", value))
+        expected.add("model.confidence_head.proj.weight")
+    assert draft.load_weights(iter(checkpoint)) == expected
+    assert draft.model.confidence_head is (head if include_confidence else None)
+    torch.testing.assert_close(draft.model.norm.weight, value)
+    if include_confidence:
+        torch.testing.assert_close(head.proj.weight, value)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.skip_global_cleanup
+@pytest.mark.parametrize("partial", [False, True])
+def test_v41_confidence_disabled_head_stays_disabled(v41_confidence_loader, partial):
+    from vllm.model_executor.model_loader.mtp_validation import (
+        disable_mtp_completeness_check,
+    )
+
+    draft = v41_confidence_loader
+    draft.model.confidence_head = None
+    scope = disable_mtp_completeness_check() if partial else nullcontext()
+    with scope:
+        assert (
+            draft.load_weights(
+                iter([("mtp.2.confidence_head.proj.weight", torch.ones(1, 2))])
+            )
+            == set()
+        )
+    assert draft.model.confidence_head is None
 
 
 @pytest.mark.cpu_test
