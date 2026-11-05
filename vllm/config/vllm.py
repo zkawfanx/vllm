@@ -1041,7 +1041,7 @@ class VllmConfig:
             self.compilation_config.mode = CompilationMode.NONE
         return enabled
 
-    def __post_init__(self):
+    def __post_init__(self, *, resolve_breakable_cudagraph: bool = True):
         """Verify configs are valid & consistent with each other."""
 
         # To give each torch profile run a unique instance name.
@@ -1278,7 +1278,11 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        self._maybe_enable_breakable_cudagraph()
+        if (
+            resolve_breakable_cudagraph
+            or self.compilation_config.use_breakable_cudagraph is None
+        ):
+            self._maybe_enable_breakable_cudagraph()
 
         if self.compilation_config.backend == "eager" or (
             self.compilation_config.mode is not None

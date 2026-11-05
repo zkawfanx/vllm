@@ -136,6 +136,25 @@ def test_breakable_cudagraph_config_survives_serialization(
     assert other.compute_hash() != config.compute_hash()
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_breakable_cudagraph_handshake_keeps_resolved_config(monkeypatch, enabled):
+    """Handshake validation must keep the graph choice made before worker startup."""
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(enabled)))
+    envs.disable_envs_cache()
+    config = VllmConfig(
+        compilation_config=CompilationConfig(use_breakable_cudagraph=not enabled)
+    )
+    assert config.compilation_config.use_breakable_cudagraph is enabled
+    expected_mode = config.compilation_config.mode
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    envs.disable_envs_cache()
+    config.__post_init__(resolve_breakable_cudagraph=False)
+
+    assert config.compilation_config.use_breakable_cudagraph is enabled
+    assert config.compilation_config.mode == expected_mode
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == str(int(not enabled))
+
+
 @pytest.mark.parametrize(
     ("env_value", "expected"),
     [
