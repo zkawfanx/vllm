@@ -329,6 +329,57 @@ class TestToolResultContent:
             "https://example.com/img2.jpg",
         ]
 
+    @pytest.mark.parametrize("tool_use_id", ["call_001", None])
+    @pytest.mark.parametrize("mixed", [False, True], ids=["references", "mixed"])
+    def test_tool_references_stay_in_one_result(self, tool_use_id, mixed):
+        """References lead text, with images following the single tool message."""
+        content = [
+            {"type": "tool_reference", "tool_name": "get_weather"},
+            {"type": "tool_reference", "name": "get_time"},
+        ]
+        expected = [
+            {"type": "tool_reference", "name": "get_weather"},
+            {"type": "tool_reference", "name": "get_time"},
+        ]
+        if mixed:
+            content.insert(0, {"type": "text", "text": "2 tools found"})
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AAAA",
+                    },
+                }
+            )
+            content.append({"type": "text", "text": "Use one."})
+            expected.append({"type": "text", "text": "2 tools found\nUse one."})
+        request = self._make_tool_result_request(content)
+        blocks = request.messages[-1].content
+        assert isinstance(blocks, list)
+        blocks[0].tool_use_id = tool_use_id
+        original = request.model_dump()
+
+        for _ in range(2):
+            result = _convert(request)
+            assert [m["role"] for m in result.messages] == ["assistant", "tool"] + (
+                ["user"] if mixed else []
+            )
+            assert result.messages[1] == {
+                "role": "tool",
+                "tool_call_id": tool_use_id or "",
+                "content": expected,
+            }
+            if mixed:
+                assert result.messages[2]["content"] == [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    }
+                ]
+            assert request.model_dump() == original
+
     def test_tool_result_none_content(self):
         request = self._make_tool_result_request(None)
         result = _convert(request)
