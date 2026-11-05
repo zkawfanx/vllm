@@ -51,6 +51,110 @@ def test_compile_config_repr_succeeds():
     assert "inductor_passes" in val
 
 
+def _breakable_resolution_stub(architecture):
+    return SimpleNamespace(
+        model_config=(
+            SimpleNamespace(architectures=[architecture]) if architecture else None
+        ),
+        compilation_config=CompilationConfig(),
+    )
+
+
+def test_breakable_cudagraph_resolution_is_per_config(monkeypatch):
+    """A breakable-by-default model must not change later engines' defaults."""
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    envs.disable_envs_cache()
+
+    deepseek = _breakable_resolution_stub("DeepseekV41ForCausalLM")
+    assert VllmConfig._maybe_enable_breakable_cudagraph(deepseek)
+    assert deepseek.compilation_config.use_breakable_cudagraph is True
+    assert deepseek.compilation_config.mode == CompilationMode.NONE
+    assert os.getenv("VLLM_USE_BREAKABLE_CUDAGRAPH") is None
+
+    other = _breakable_resolution_stub("Qwen2_5_VLForConditionalGeneration")
+    assert not VllmConfig._maybe_enable_breakable_cudagraph(other)
+    assert other.compilation_config.use_breakable_cudagraph is False
+    assert other.compilation_config.mode is None
+    assert deepseek.compilation_config.use_breakable_cudagraph is True
+
+
+@pytest.mark.parametrize(
+    "architecture,default_enabled",
+    [
+        ("DeepseekV4ForCausalLM", True),
+        ("DeepseekV41ForCausalLM", True),
+        ("DeepSeekV4MTPModel", True),
+        ("InklingForCausalLM", True),
+        ("InklingForConditionalGeneration", True),
+        ("KimiK3ForConditionalGeneration", True),
+        ("KimiK3MTPModel", True),
+        ("KimiLinearForCausalLM", True),
+        ("MiniMaxM3SparseForCausalLM", True),
+        ("MiniMaxM3SparseForConditionalGeneration", True),
+        ("Qwen2_5_VLForConditionalGeneration", False),
+        (None, False),
+    ],
+)
+@pytest.mark.parametrize("env_value", [None, "0", "1"])
+def test_breakable_cudagraph_env_override(
+    monkeypatch, architecture, default_enabled, env_value
+):
+    if env_value is None:
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", env_value)
+    envs.disable_envs_cache()
+    expected = default_enabled if env_value is None else env_value == "1"
+    config = _breakable_resolution_stub(architecture)
+
+    assert VllmConfig._maybe_enable_breakable_cudagraph(config) is expected
+    assert config.compilation_config.use_breakable_cudagraph is expected
+    assert config.compilation_config.mode == (
+        CompilationMode.NONE if expected else None
+    )
+    assert os.environ.get("VLLM_USE_BREAKABLE_CUDAGRAPH") == env_value
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("serializer", ["pickle", "cloudpickle"])
+def test_breakable_cudagraph_config_survives_serialization(
+    monkeypatch, enabled, serializer
+):
+    import importlib
+
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+
+    pickle = importlib.import_module(serializer)
+    config = CompilationConfig(use_breakable_cudagraph=enabled)
+    restored = pickle.loads(pickle.dumps(config))
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    envs.disable_envs_cache()
+
+    assert is_breakable_cudagraph_enabled(restored) is enabled
+    assert restored.compute_hash() == config.compute_hash()
+    other = CompilationConfig(use_breakable_cudagraph=not enabled)
+    assert other.compute_hash() != config.compute_hash()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_breakable_cudagraph_handshake_keeps_resolved_config(monkeypatch, enabled):
+    """Handshake validation must keep the graph choice made before worker startup."""
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(enabled)))
+    envs.disable_envs_cache()
+    config = VllmConfig(
+        compilation_config=CompilationConfig(use_breakable_cudagraph=not enabled)
+    )
+    assert config.compilation_config.use_breakable_cudagraph is enabled
+    expected_mode = config.compilation_config.mode
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    envs.disable_envs_cache()
+    config.__post_init__(resolve_breakable_cudagraph=False)
+
+    assert config.compilation_config.use_breakable_cudagraph is enabled
+    assert config.compilation_config.mode == expected_mode
+    assert os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] == str(int(not enabled))
+
+
 @pytest.mark.parametrize(
     ("env_value", "expected"),
     [

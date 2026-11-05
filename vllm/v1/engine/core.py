@@ -1184,8 +1184,9 @@ class EngineCoreProc(EngineCore):
                 addresses.outputs = client_addresses.outputs
                 yield addresses
 
-        # Update config which may have changed from the handshake
-        vllm_config.__post_init__()
+        # Update handshake changes without resolving this engine's graph choice
+        # again from the worker's environment.
+        vllm_config.__post_init__(resolve_breakable_cudagraph=False)
 
     @contextmanager
     def _perform_handshake(

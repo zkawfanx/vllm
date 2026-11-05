@@ -34,7 +34,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
-from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.config import CompilationConfig, CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.forward_context import (
     BatchDescriptor,
@@ -50,7 +50,14 @@ from vllm.utils.torch_utils import weak_ref_tensor, weak_ref_tensors
 logger = init_logger(__name__)
 
 
-def is_breakable_cudagraph_enabled() -> bool:
+def is_breakable_cudagraph_enabled(
+    compilation_config: CompilationConfig | None = None,
+) -> bool:
+    if (
+        compilation_config is not None
+        and compilation_config.use_breakable_cudagraph is not None
+    ):
+        return compilation_config.use_breakable_cudagraph
     return bool(envs.VLLM_USE_BREAKABLE_CUDAGRAPH)
 
 
