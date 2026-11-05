@@ -20,6 +20,7 @@ DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
 DSML_INVOKE_END = "</｜DSML｜ invoke>"
 DSML_PARAM_START = "<｜DSML｜ parameter"
 DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
+DEEPSEEK_TURN_BOUNDARY_TOKENS = frozenset({"<｜User｜>", "<｜Assistant｜>"})
 
 _PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(
     DSML_PARAM_START, DSML_PARAM_CLOSE, implicit_close=True
@@ -40,6 +41,7 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
     return replace(
         config,
         name="deepseek_v41",
+        turn_boundary_tokens=DEEPSEEK_TURN_BOUNDARY_TOKENS,
         terminals={**config.terminals, **terminal_overrides},
         token_id_terminals={
             key: terminal_overrides.get(key, value)
@@ -73,7 +75,7 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
         if end_id is None:
             return 0
 
-        in_reasoning = True
+        in_reasoning = not self._prompt_closes_reasoning
         count = 0
         for token_id in token_ids:
             if start_id is not None and token_id == start_id:

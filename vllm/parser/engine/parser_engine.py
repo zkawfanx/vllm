@@ -123,6 +123,7 @@ class ParserEngine(Parser):
             or parser_engine_config.initial_state == ParserState.REASONING
         )
         self._reasoning_ended: bool = not self._has_reasoning
+        self._prompt_closes_reasoning: bool = False
         self._streaming_initialized: bool = False
         self._prompt_streaming_prepared: bool = False
 
@@ -155,6 +156,11 @@ class ParserEngine(Parser):
             self._reasoning_start_token_id = vocab.get(start_text)
         if end_text:
             self._reasoning_end_token_id = vocab.get(end_text)
+        self._turn_boundary_token_ids: frozenset[int] = frozenset(
+            token_id
+            for token in parser_engine_config.turn_boundary_tokens
+            if (token_id := vocab.get(token)) is not None
+        )
 
     @property
     def reasoning_start_str(self) -> str | None:
@@ -190,6 +196,18 @@ class ParserEngine(Parser):
             self._streaming_initialized = True
             self._reset(initial_state=initial_state)
 
+    def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
+        """Start parsing in content when the prompt already closes reasoning,
+        as with continue_final_message or a template that switches thinking
+        off. Only configs with turn boundaries can tell a closed block in
+        this turn from one in an earlier turn, so others are left as is.
+        """
+        self._prompt_closes_reasoning = (
+            self.parser_engine_config.initial_state is ParserState.REASONING
+            and bool(self._turn_boundary_token_ids)
+            and self.is_reasoning_end(list(prompt_token_ids))
+        )
+
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         """See :meth:`ReasoningParser.adjust_initial_state_from_prompt`."""
         return
@@ -201,8 +219,11 @@ class ParserEngine(Parser):
         return None
 
     def _reset(self, initial_state: ParserState | None = None) -> None:
-        self._engine.reset(initial_state=initial_state)
-        self._reasoning_ended = not self._has_reasoning
+        prompt_closed = initial_state is None and self._prompt_closes_reasoning
+        self._engine.reset(
+            initial_state=ParserState.CONTENT if prompt_closed else initial_state
+        )
+        self._reasoning_ended = not self._has_reasoning or prompt_closed
         self._tool_slots.clear()
         self._deferred_content = ""
         self._deferred_reasoning = ""
@@ -462,6 +483,9 @@ class ParserEngine(Parser):
     ) -> DeltaMessage | None:
         self._initialize_history_tool_call_cnt(request)
         if not self._prompt_streaming_prepared and prompt_token_ids is not None:
+            self.set_prompt_token_ids(prompt_token_ids)
+            if self._prompt_closes_reasoning:
+                self.initialize_streaming()
             # NOTE: call the hook BEFORE setting the flag, because the hook
             # may invoke ``_reset`` (e.g. via ``initialize_streaming``) which
             # clears ``_prompt_streaming_prepared``.
@@ -627,11 +651,17 @@ class ParserEngine(Parser):
         if end_id is not None:
             if not input_ids:
                 return self.parser_engine_config.initial_state != ParserState.REASONING
+            boundary_ids = self._turn_boundary_token_ids
             for i in range(len(input_ids) - 1, -1, -1):
-                if input_ids[i] == end_id:
+                token_id = input_ids[i]
+                if token_id == end_id:
                     return True
-                if start_id is not None and input_ids[i] == start_id:
+                if start_id is not None and token_id == start_id:
                     return False
+                if token_id in boundary_ids:
+                    return (
+                        self.parser_engine_config.initial_state != ParserState.REASONING
+                    )
             return False
         return self._reasoning_ended
 
@@ -671,9 +701,7 @@ class ParserEngine(Parser):
 
     # ── Single-pass parse helper ────────────────────────────────────────
 
-    def _orphan_reasoning_prefix_events(
-        self, text: str
-    ) -> "list[SemanticEvent]":
+    def _orphan_reasoning_prefix_events(self, text: str) -> list[SemanticEvent]:
         """Seed the state machine when reasoning was opened in the PROMPT.
 
         DSv4's thinking template ends the prompt with the reasoning start
@@ -683,7 +711,7 @@ class ParserEngine(Parser):
         applies. No-op when the output opens its own reasoning block, when
         no end marker is present, or when the parser has no reasoning.
         """
-        if not self.prompt_may_open_reasoning:
+        if not self.prompt_may_open_reasoning or self._prompt_closes_reasoning:
             return []
         start = self.reasoning_start_str
         end = self.reasoning_end_str

@@ -351,12 +351,29 @@ class TestValidateGeneratorInput:
 
 
 @pytest.mark.asyncio
-async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
+@pytest.mark.parametrize(
+    ("parser_name", "prompt_ids", "text", "token_ids", "reasoning_tokens"),
+    [
+        ("qwen3", [7, 8], "<think>reason</think>final", [1, 10, 2, 20], 1),
+        ("deepseek_v41", [6, 1, 2, 10], "final", [20], 0),
+        ("deepseek_v41", [6, 1, 2, 5, 10, 6], "reason</think>final", [10, 2, 20], 1),
+    ],
+)
+async def test_reasoning_tokens_counted_for_text_reasoning_model(
+    monkeypatch, parser_name, prompt_ids, text, token_ids, reasoning_tokens
+):
     """Ensure reasoning_tokens usage is derived from thinking token spans."""
 
     class FakeTokenizer:
         def __init__(self):
-            self._vocab = {"<think>": 1, "</think>": 2, "reason": 3, "final": 4}
+            self._vocab = {
+                "<think>": 1,
+                "</think>": 2,
+                "reason": 3,
+                "final": 4,
+                "<｜User｜>": 5,
+                "<｜Assistant｜>": 6,
+            }
 
         def get_vocab(self):
             return self._vocab
@@ -385,7 +402,7 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
-        reasoning_parser="qwen3",
+        reasoning_parser=parser_name,
     )
 
     request = ResponsesRequest(input="hi", tools=[], stream=False)
@@ -397,10 +414,9 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
 
     # Build a SimpleContext with thinking tokens in the output.
     context = SimpleContext(response_parser=response_parser)
-    token_ids = [1, 10, 2, 20]  # <think> 10 </think> 20 -> reasoning token count = 1
     completion = CompletionOutput(
         index=0,
-        text="<think>reason</think>final",
+        text=text,
         token_ids=token_ids,
         cumulative_logprob=0.0,
         logprobs=None,
@@ -410,7 +426,7 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
     req_output = RequestOutput(
         request_id="req",
         prompt="hi",
-        prompt_token_ids=[7, 8],
+        prompt_token_ids=prompt_ids,
         prompt_logprobs=None,
         outputs=[completion],
         finished=True,
@@ -434,7 +450,10 @@ async def test_reasoning_tokens_counted_for_text_reasoning_model(monkeypatch):
         request_metadata=metadata,
     )
 
-    assert response.usage.output_tokens_details.reasoning_tokens == 1
+    assert response.usage.output_tokens_details.reasoning_tokens == reasoning_tokens
+    if reasoning_tokens == 0:
+        assert response.output[0].type == "message"
+        assert response.output[0].content[0].text == "final"
 
 
 class TestExtractAllowedToolsFromMcpRequests:

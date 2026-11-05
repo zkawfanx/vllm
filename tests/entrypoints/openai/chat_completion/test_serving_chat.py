@@ -45,6 +45,7 @@ from vllm.inputs import TokensPrompt
 from vllm.multimodal.inputs import PlaceholderRange
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import HarmonyParser
+from vllm.parser.parser_manager import ParserManager
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.mistral import MistralRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -687,6 +688,42 @@ async def _collect_metrics_stream_chunks(
         if payload != "[DONE]":
             chunks.append(json.loads(payload))
     return chunks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_closed", [False, True])
+async def test_full_chat_uses_current_prompt_for_reasoning(prompt_closed):
+    serving = _build_minimal_metrics_serving_chat(enable_per_request_metrics=False)
+    tokenizer = MagicMock()
+    vocab = {"<think>": 50, "</think>": 51, "<｜User｜>": 54, "<｜Assistant｜>": 55}
+    tokenizer.get_vocab.return_value = vocab
+    tokenizer.all_special_tokens = list(vocab)
+    tokenizer.all_special_ids = list(vocab.values())
+    parser_cls = ParserManager.get_parser(reasoning_parser_name="deepseek_v41")
+    parser = parser_cls(tokenizer)
+    output = _make_metrics_request_output()
+    output.prompt_token_ids = [55, 50, 51] if prompt_closed else [51, 54, 100, 55]
+    request = ChatCompletionRequest(
+        model="test-model", messages=[{"role": "user", "content": "Test"}]
+    )
+
+    response = await serving.chat_completion_full_generator(
+        request,
+        _single_request_output(output),
+        "chatcmpl-test-id",
+        "test-model",
+        conversation=request.messages,
+        tokenizer=tokenizer,
+        request_metadata=RequestResponseMetadata(request_id="chatcmpl-test-id"),
+        parser=parser,
+    )
+
+    message = response.choices[0].message
+    assert (message.reasoning or "") == ("" if prompt_closed else "Hello")
+    assert (message.content or "") == ("Hello" if prompt_closed else "")
+    assert parser.reasoning_parser.count_reasoning_tokens(
+        output.outputs[0].token_ids
+    ) == (0 if prompt_closed else 2)
 
 
 def test_build_per_request_timing_metrics_valid_timestamps():

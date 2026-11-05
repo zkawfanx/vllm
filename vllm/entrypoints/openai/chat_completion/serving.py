@@ -870,6 +870,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 logprobs = None
 
             if parser is not None:
+                if final_res.prompt_token_ids is not None:
+                    parser.set_prompt_token_ids(final_res.prompt_token_ids)
                 reasoning, content, tool_calls = parser.parse(
                     output.text,
                     request,

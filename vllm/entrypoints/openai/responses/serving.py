@@ -868,6 +868,12 @@ class OpenAIServingResponses(GenerateBaseServing):
             if final_output.finish_reason == "length":
                 status = "incomplete"
 
+            if (
+                context.response_parser is not None
+                and final_res.prompt_token_ids is not None
+            ):
+                context.response_parser.set_prompt_token_ids(final_res.prompt_token_ids)
+
             output = self._make_response_output_items(
                 request,
                 final_output,
