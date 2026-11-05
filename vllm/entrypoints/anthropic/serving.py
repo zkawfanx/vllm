@@ -1002,7 +1002,8 @@ class AnthropicServingMessages(OpenAIServingChat):
             request,
             merge_inline_system=self._merge_inline_system,
         )
-        result = await self.render_chat_request(chat_req)
+        # Counting never sends media to the engine's receiver cache.
+        result = await self.render_chat_request(chat_req, skip_mm_cache=True)
         if isinstance(result, ErrorResponse):
             return result
 

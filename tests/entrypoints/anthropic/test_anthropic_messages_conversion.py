@@ -20,6 +20,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from vllm.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
     AnthropicMessagesRequest,
 )
 from vllm.entrypoints.anthropic.serving import (
@@ -40,6 +42,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     PromptTokenUsageInfo,
     UsageInfo,
 )
+from vllm.multimodal.cache import (
+    MultiModalProcessorOnlyCache,
+    MultiModalProcessorSenderCache,
+    MultiModalReceiverCache,
+)
+from vllm.multimodal.inputs import MultiModalKwargsItem
 
 _convert = AnthropicServingMessages._convert_anthropic_to_openai_request
 _img_url = AnthropicServingMessages._convert_image_source_to_url
@@ -1476,3 +1484,61 @@ def test_anthropic_routes_classify_renderer_validation_errors(
     assert response.json()["type"] == "error"
     assert response.json()["error"]["type"] == error_type
     assert response.json()["error"]["message"] == str(error)
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_keeps_cold_media_available_for_generation(monkeypatch):
+    """Count-only requests must not create sender entries without receiver data."""
+    model_config = MagicMock()
+    model_config.get_multimodal_config.return_value.mm_processor_cache_gb = 1
+    sender = MultiModalProcessorSenderCache(model_config)
+    receiver = MultiModalReceiverCache(model_config)
+    readonly = MultiModalProcessorOnlyCache(model_config)
+    item = MultiModalKwargsItem.dummy()
+    rendered_data: list[MultiModalKwargsItem | None] = []
+
+    async def render_chat(request, *, skip_mm_cache=False):
+        cache = readonly if skip_mm_cache else sender
+        data, _ = cache.get_and_update_item((item, []), "cold-image")
+        rendered_data.append(data)
+        return [], [{"prompt_token_ids": [1, 2, 3]}]
+
+    serving = object.__new__(AnthropicServingMessages)
+    serving._merge_inline_system = False
+    monkeypatch.setattr(serving, "_check_model", AsyncMock(return_value=None))
+    serving.engine_client = MagicMock(errored=False)
+    serving.online_renderer = MagicMock(render_chat=render_chat)
+    request = AnthropicCountTokensRequest(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/cold.png",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+
+    for _ in range(2):
+        counted = await serving.count_tokens(request)
+        assert isinstance(counted, AnthropicCountTokensResponse)
+        assert counted.input_tokens == 3
+        assert not sender.is_cached_item("cold-image")
+
+    chat_request = _convert(request)
+    await serving.render_chat_request(chat_request)
+    assert rendered_data[-1] is item
+    assert receiver.get_and_update_item(rendered_data[-1], "cold-image") is item
+
+    # Counting a warm image must not disturb the ordinary IPC cache hit.
+    await serving.count_tokens(request)
+    await serving.render_chat_request(chat_request)
+    assert rendered_data[-1] is None
+    assert receiver.get_and_update_item(rendered_data[-1], "cold-image") is item
