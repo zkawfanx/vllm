@@ -13,8 +13,9 @@ Also covers cache usage computation in ``_build_anthropic_usage``.
 """
 
 import json
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -1437,3 +1438,41 @@ class TestMessagesFullConverter:
         assert len(result.content) == 1
         assert result.content[0].type == "text"
         assert result.content[0].text == ""
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/messages", "/v1/messages/count_tokens"])
+@pytest.mark.parametrize(
+    ("error", "status", "error_type"),
+    [
+        (ValueError("image special token is reserved"), 400, "BadRequestError"),
+        (RuntimeError("generation failed"), 500, "internal_error"),
+    ],
+)
+def test_anthropic_routes_classify_renderer_validation_errors(
+    endpoint, error, status, error_type
+):
+    """Renderer input errors use HTTP 400; server failures retain HTTP 500."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from vllm.entrypoints.anthropic.api_router import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.anthropic_serving_messages = SimpleNamespace(
+        create_messages=AsyncMock(side_effect=error),
+        count_tokens=AsyncMock(side_effect=error),
+        create_error_response=AnthropicServingMessages.create_error_response,
+    )
+    body: dict[str, Any] = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    if endpoint == "/v1/messages":
+        body["max_tokens"] = 16
+    with TestClient(app) as client:
+        response = client.post(endpoint, json=body)
+    assert response.status_code == status
+    assert response.json()["type"] == "error"
+    assert response.json()["error"]["type"] == error_type
+    assert response.json()["error"]["message"] == str(error)
