@@ -403,9 +403,8 @@ __device__ __noinline__ void histogram_2048_topk(
         }
       }
 
-      const uint32_t packed =
-          (static_cast<uint32_t>(__popc(def_bits)) << 16) |
-          static_cast<uint32_t>(__popc(tie_bits));
+      const uint32_t packed = (static_cast<uint32_t>(__popc(def_bits)) << 16) |
+                              static_cast<uint32_t>(__popc(tie_bits));
       uint32_t winc = packed;
 #pragma unroll
       for (uint32_t o = 1; o < 32; o *= 2) {
@@ -424,16 +423,17 @@ __device__ __noinline__ void histogram_2048_topk(
       }
       const uint32_t thread_excl = inter_prefix + (winc - packed);
 
-      int def_prefix = decode_smem[SBASE + sBUF0] +
-                       static_cast<int>(thread_excl >> 16);
-      int tie_prefix = decode_smem[SBASE + sBUF1] +
-                       static_cast<int>(thread_excl & 0xFFFF);
+      int def_prefix =
+          decode_smem[SBASE + sBUF0] + static_cast<int>(thread_excl >> 16);
+      int tie_prefix =
+          decode_smem[SBASE + sBUF1] + static_cast<int>(thread_excl & 0xFFFF);
 
 #pragma unroll 4
       for (int sub = 0; sub < 4; sub++) {
         const int elem_idx = (i << 2) + sub;
         if (def_bits & (1u << sub)) {
-          const int tie_used = (tie_prefix < tie_slots) ? tie_prefix : tie_slots;
+          const int tie_used =
+              (tie_prefix < tie_slots) ? tie_prefix : tie_slots;
           output_indices[def_prefix + tie_used] = elem_idx;
           def_prefix++;
         } else if (tie_bits & (1u << sub)) {
@@ -560,8 +560,7 @@ __device__ __noinline__ void histogram_256_topk(
 
       compute_cumulative_sum();
 
-      if (thread_id < RADIX &&
-          shared_histogram[0][thread_id] >= remaining_k &&
+      if (thread_id < RADIX && shared_histogram[0][thread_id] >= remaining_k &&
           shared_histogram[0][thread_id + 1] < remaining_k) {
         shared_threshold_bin = thread_id;
         shared_final_k = shared_histogram[0][thread_id + 1];
@@ -935,8 +934,8 @@ __device__ void radix_topk(const float* __restrict__ row_input,
   }
 
   // Index-ordered selection sweep over this CTA's chunk.
-  uint32_t* warp_sums = local_histogram;        // 32 entries scratch
-  uint32_t* running = local_histogram + 32;     // [def, tie]
+  uint32_t* warp_sums = local_histogram;     // 32 entries scratch
+  uint32_t* running = local_histogram + 32;  // [def, tie]
   if (tx == 0) {
     running[0] = 0;
     running[1] = 0;
@@ -1362,8 +1361,7 @@ __global__ void __launch_bounds__(FILTERED_TOPK_BLOCK_THREADS)
     }
     const uint32_t thread_excl = inter_prefix + (winc - packed);
 
-    const int def_prefix =
-        s_num_input[0] + static_cast<int>(thread_excl >> 16);
+    const int def_prefix = s_num_input[0] + static_cast<int>(thread_excl >> 16);
     const int tie_prefix =
         s_num_input[1] + static_cast<int>(thread_excl & 0xFFFF);
 
@@ -1417,7 +1415,11 @@ cudaError_t FilteredTopKRaggedTransform(const DType* input,
   void* args[] = {&input,    &output_indices, &lengths,
                   &num_rows, &top_k_val,      &max_len};
 
-  const int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
+  int vec_size = ComputeFilteredTopKVecSize<DType>(max_len);
+  const auto base = reinterpret_cast<uintptr_t>(input);
+  while (vec_size > 1 && base % (vec_size * sizeof(DType)) != 0) {
+    vec_size /= 2;
+  }
 
 #define DISPATCH_VEC_SIZE(VS)                                                 \
   if (vec_size == VS) {                                                       \

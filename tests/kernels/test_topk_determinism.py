@@ -62,8 +62,14 @@ def _run_persistent(logits, lengths, k, max_len):
 def _run_decode(logits, lengths, k, max_len):
     out = torch.full((logits.shape[0], k), -1, dtype=torch.int32, device="cuda")
     ops.top_k_per_row_decode(
-        logits, 1, lengths, out, logits.shape[0],
-        logits.stride(0), logits.stride(1), k,
+        logits,
+        1,
+        lengths,
+        out,
+        logits.shape[0],
+        logits.stride(0),
+        logits.stride(1),
+        k,
     )
     return out
 
@@ -94,9 +100,9 @@ def test_persistent_topk_radix_graph_replay(k: int, rows: int):
     n = 65537
     logits = torch.stack([_make_logits("dup-vals", n, seed=r) for r in range(rows)])
     lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
-    expected = torch.stack([
-        torch.argsort(-row, stable=True)[:k].sort().values for row in logits
-    ]).to(torch.int32)
+    expected = torch.stack(
+        [torch.argsort(-row, stable=True)[:k].sort().values for row in logits]
+    ).to(torch.int32)
     out = torch.empty((rows, k), dtype=torch.int32, device="cuda")
     ws = torch.zeros(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
     stream = torch.cuda.Stream()
@@ -136,6 +142,24 @@ def test_topk_deterministic_and_exact(kernel: str, scenario: str, n: int):
             f"{kernel} output differs between identical runs "
             f"({scenario}, n={n}, iter {it + 1})"
         )
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows,n", [(1, 8192), (2, 65536), (33, 65536)])
+@pytest.mark.parametrize("offset", [0, 1, 2])
+@torch.inference_mode()
+def test_persistent_topk_shifted_base(rows: int, n: int, offset: int):
+    """Both dispatch routes must respect base alignment, not just row stride."""
+    storage = torch.empty(rows * n + offset, device="cuda")
+    logits = storage[offset:].view(rows, n)
+    logits.copy_(_make_logits("unique", n))
+    lengths = torch.full((rows,), n, dtype=torch.int32, device="cuda")
+
+    first = _run_persistent(logits, lengths, K, n)
+    expected = _reference_set(logits[0], K)
+    for row in first.tolist():
+        assert frozenset(row) == expected
+    assert torch.equal(first, _run_persistent(logits, lengths, K, n))
 
 
 @requires_cuda
