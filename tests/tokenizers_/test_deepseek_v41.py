@@ -6,9 +6,10 @@ import copy
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
+import regex as re
 
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.chat_utils import BaseMultiModalItemTracker
@@ -274,6 +275,41 @@ def test_unsupported_media_is_a_request_error():
         render([{"role": "user", "content": [{"type": "input_audio"}]}])
 
 
+@pytest.mark.parametrize("tool_call_id", ["tool_search", ""])
+def test_tool_references_render_as_tool_names(tool_call_id):
+    messages = [
+        {"role": "assistant", "tool_calls": [tool_call("tool_search")]},
+        {
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": [
+                {"type": "tool_reference", "name": "get_weather"},
+                {"type": "tool_reference", "name": "get_time"},
+                {"type": "text", "text": "2 tools found"},
+            ],
+        },
+    ]
+    original = copy.deepcopy(messages)
+    assert render(messages, thinking=False).endswith(
+        "<｜User｜><tool_result>get_weather\n\nget_time\n\n2 tools found"
+        "</tool_result><｜Assistant｜></think>"
+    )
+    assert messages == original
+
+
+def test_tool_reference_cannot_inject_image_placeholder():
+    with pytest.raises(ValueError, match="image special token"):
+        render(
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "tool_search",
+                    "content": [{"type": "tool_reference", "name": IMAGE_PLACEHOLDER}],
+                }
+            ]
+        )
+
+
 @pytest.fixture(params=[False, True], ids=["sync", "async"])
 def render_with_media(request, monkeypatch):
     # Keep real message parsing and image tracking; no model download is needed.
@@ -333,6 +369,116 @@ def test_validated_tool_history_renders_without_consuming_calls(render_with_medi
 
     assert prompt["prompt"] == expected
     assert messages == original
+
+
+@pytest.mark.parametrize("reverse_results", [False, True])
+@pytest.mark.parametrize("mixed", [False, True], ids=["references", "mixed"])
+def test_anthropic_tool_search_parallel_results_and_replay(
+    render_with_media, reverse_results, mixed
+):
+    """Exercise conversion and both renderer paths, including validated iterators."""
+    from vllm.entrypoints.anthropic.protocol import AnthropicMessagesRequest
+    from vllm.entrypoints.anthropic.serving import AnthropicServingMessages
+
+    convert = AnthropicServingMessages._convert_anthropic_to_openai_request
+    results: list[dict[str, Any]] = [
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool_search",
+            "content": [{"type": "tool_reference", "tool_name": "get_weather"}],
+        },
+        {"type": "tool_result", "tool_use_id": "read_file", "content": "NOTES"},
+    ]
+    if mixed:
+        results[0]["content"].insert(0, {"type": "text", "text": "1 tool found"})
+        results[0]["content"].append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": (
+                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
+                        "AAAAC0lEQVR42mP8/x8AAwMCAO+aXs8AAAAASUVORK5CYII="
+                    ),
+                },
+            }
+        )
+    messages = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "tool_use", "id": name, "name": name, "input": {}}
+                for name in ("tool_search", "read_file")
+            ],
+        },
+        {"role": "user", "content": results[::-1] if reverse_results else results},
+    ]
+    tools = [
+        {"name": "tool_search", "input_schema": {"type": "object"}},
+        {"name": "read_file", "input_schema": {"type": "object"}},
+        {
+            "name": "get_weather",
+            "input_schema": {"type": "object"},
+            "defer_loading": True,
+        },
+    ]
+    for replay in (False, True):
+        request = AnthropicMessagesRequest(
+            model="test-model", max_tokens=16, messages=messages, tools=tools
+        )
+        original = request.model_dump()
+        converted = convert(request)
+        kwargs = converted.build_chat_params(
+            None, "auto"
+        ).get_apply_chat_template_kwargs()
+        kwargs["thinking"] = False
+        assert converted.tools is not None
+        kwargs["tools"] = [
+            tool.model_dump(exclude_none=True) for tool in converted.tools
+        ]
+        # Serialize a separate conversion so the render path must materialize its
+        # own validated tool-call iterators, without the test consuming them first.
+        expected = render(convert(request).model_dump()["messages"], **kwargs)
+        rendered = render_with_media(
+            converted.messages, expected_prompt=expected, **kwargs
+        )
+        prompt = rendered["prompt"]
+        assert re.findall(r"<tool_result>(.*?)</tool_result>", prompt, re.DOTALL) == (
+            ["get_weather\n\n1 tool found" if mixed else "get_weather", "NOTES"]
+            + (["sunny"] if replay else [])
+        )
+        assert '"name": "get_weather"' in prompt
+        assert prompt.endswith("<｜Assistant｜></think>")
+        if mixed:
+            assert prompt.count(IMAGE_PLACEHOLDER) == 1
+            assert len(rendered["multi_modal_data"]["image"]) == 1
+        assert request.model_dump() == original
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "weather",
+                            "name": "get_weather",
+                            "input": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "weather",
+                            "content": "sunny",
+                        }
+                    ],
+                },
+            ]
+        )
 
 
 def _image(color):

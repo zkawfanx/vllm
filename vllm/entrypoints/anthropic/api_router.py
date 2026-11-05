@@ -69,6 +69,8 @@ async def create_messages(request: AnthropicMessagesRequest, raw_request: Reques
 
     try:
         generator = await handler.create_messages(request, raw_request)
+    except ValueError as e:
+        return translate_error_response(handler.create_error_response(e))
     except Exception as e:
         logger.exception("Error in create_messages: %s", e)
         return JSONResponse(
@@ -115,6 +117,8 @@ async def count_tokens(request: AnthropicCountTokensRequest, raw_request: Reques
 
     try:
         response = await handler.count_tokens(request, raw_request)
+    except ValueError as e:
+        return translate_error_response(handler.create_error_response(e))
     except Exception as e:
         logger.exception("Error in count_tokens: %s", e)
         return JSONResponse(
