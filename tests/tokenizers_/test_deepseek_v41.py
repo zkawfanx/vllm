@@ -13,6 +13,7 @@ import pytest
 from tests.tokenizers_.test_deepseek_v4 import FakeHfTokenizer
 from vllm.entrypoints.chat_utils import BaseMultiModalItemTracker
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.serve.tokenize.protocol import TokenizeChatRequest
 from vllm.renderers.deepseek_v4 import DeepseekV4Renderer
 from vllm.renderers.params import ChatParams
 from vllm.renderers.registry import RENDERER_REGISTRY
@@ -301,8 +302,10 @@ def render_with_media(request, monkeypatch):
     renderer.tokenizer = get_deepseek_v41_tokenizer(FakeHfTokenizer())
     renderer._apply_chat_template_async = make_async(renderer._apply_chat_template)
 
-    def run(messages, **kwargs):
-        expected = render(messages, **kwargs)
+    def run(messages, expected_prompt=None, **kwargs):
+        expected = (
+            render(messages, **kwargs) if expected_prompt is None else expected_prompt
+        )
         params = ChatParams(chat_template_kwargs={"tokenize": False, **kwargs})
         if request.param:
             _, prompt = asyncio.run(renderer.render_messages_async(messages, params))
@@ -312,6 +315,24 @@ def render_with_media(request, monkeypatch):
         return prompt
 
     return run
+
+
+def test_validated_tool_history_renders_without_consuming_calls(render_with_media):
+    messages = [
+        {"role": "user", "content": "Look up a number."},
+        {"role": "assistant", "content": None, "tool_calls": [tool_call("lookup")]},
+        {"role": "tool", "tool_call_id": "lookup", "content": "12"},
+    ]
+    original = copy.deepcopy(messages)
+    request = TokenizeChatRequest(messages=messages)
+    expected = render(messages, thinking=False)
+
+    prompt = render_with_media(
+        request.messages, expected_prompt=expected, thinking=False
+    )
+
+    assert prompt["prompt"] == expected
+    assert messages == original
 
 
 def _image(color):
