@@ -1001,3 +1001,28 @@ def test_workspace_topk_padded_stride(top_k: int, backend: str) -> None:
                 f"Row {i}: {backend} with padded stride doesn't match. "
                 f"seq_len={sl}, stride={padded_stride}"
             )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="This test requires CUDA")
+@pytest.mark.parametrize("num_rows", [1, 48])
+@pytest.mark.parametrize("top_k", [512, 2048])
+@pytest.mark.parametrize("overflow", [False, True])
+@torch.inference_mode()
+def test_persistent_topk_nan_ordering(num_rows: int, top_k: int, overflow: bool):
+    """Exact keys must agree with coarse bins in radix and filtered paths."""
+    seq_len = 65536
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    logits = torch.randn((num_rows, seq_len), generator=gen, device="cuda")
+    n_nan = 4 * top_k if overflow else top_k // 4
+    positions = torch.randperm(seq_len, generator=gen, device="cuda")
+    logits[:, positions[:n_nan]] = float("nan")
+    logits[:, positions[n_nan : n_nan + top_k // 8]] = float("inf")
+    lengths = torch.full((num_rows,), seq_len, dtype=torch.int32, device="cuda")
+    indices = torch.full((num_rows, top_k), -1, dtype=torch.int32, device="cuda")
+    _run_topk_backend("persistent_topk", logits, lengths, indices, top_k, seq_len)
+    assert torch.all((indices >= 0) & (indices < seq_len))
+    sorted_indices = indices.sort(dim=1).values
+    assert torch.all(sorted_indices[:, 1:] != sorted_indices[:, :-1])
+    actual = logits.gather(1, indices.long()).sort(dim=1).values
+    expected = logits.topk(top_k, dim=1).values.sort(dim=1).values
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)

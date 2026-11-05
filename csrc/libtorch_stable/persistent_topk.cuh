@@ -47,10 +47,7 @@ constexpr size_t kFixedSmemLarge =
 // Common helpers
 // ============================================================================
 
-__device__ __forceinline__ auto convert_to_uint32_v2(float x) -> uint32_t {
-  uint32_t bits = __float_as_uint(x);
-  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
-}
+using topk_histogram_4096::convert_to_uint32_v2;
 
 __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
   __half h = __float2half_rn(x);
@@ -1134,8 +1131,7 @@ struct FilteredTopKTraits<float> {
   }
 
   __device__ __forceinline__ static OrderedType ToOrdered(float x) {
-    uint32_t bits = __float_as_uint(x);
-    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+    return hist4096::convert_to_uint32_v2(x);
   }
 };
 
