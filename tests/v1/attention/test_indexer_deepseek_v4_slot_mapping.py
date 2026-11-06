@@ -35,6 +35,97 @@ def _make_indexer_test_config(
     )
 
 
+def _mapping_metadata(starts, num_tokens):
+    starts_cpu = torch.tensor(starts, dtype=torch.int32)
+    num_reqs = len(starts) - 1
+    return CommonAttentionMetadata(
+        query_start_loc=starts_cpu.cuda(),
+        query_start_loc_cpu=starts_cpu,
+        seq_lens=torch.zeros(num_reqs, dtype=torch.int32, device="cuda"),
+        num_reqs=num_reqs,
+        num_actual_tokens=num_tokens,
+        max_query_len=max(torch.diff(starts_cpu).tolist(), default=0),
+        max_seq_len=32,
+        block_table_tensor=torch.empty((num_reqs, 1), device="cuda"),
+        slot_mapping=torch.empty(num_tokens, dtype=torch.int64, device="cuda"),
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("starts", "num_tokens"),
+    [
+        ([0, 3, 5], 5),
+        ([0, 129, 257, 520], 768),
+        ([0, 0, 3, 3, 5, 5], 8),
+        ([0, 3, 5], 3),
+        ([0, 0, 0], 4),
+        ([0], 4),
+        ([0], 0),
+    ],
+)
+def test_common_token_mapping_preserves_padding_and_cache(starts, num_tokens):
+    common = _mapping_metadata(starts, num_tokens)
+    output_size = max(starts[-1], num_tokens)
+    buffer = torch.full((output_size + 2,), -1, dtype=torch.int32, device="cuda")
+    unused_buffer = torch.full_like(buffer, -2)
+    actual = common.token_to_req_indices(buffer)
+    expected = [
+        request
+        for request in range(len(starts) - 1)
+        for _ in range(starts[request + 1] - starts[request])
+    ]
+    expected += [0] * (output_size - len(expected))
+    assert actual.tolist() == expected[:num_tokens]
+    assert common._token_to_req_indices_cache.tolist() == expected
+    assert buffer[output_size:].tolist() == [-1, -1]
+    assert common.token_to_req_indices(unused_buffer).data_ptr() == actual.data_ptr()
+    assert unused_buffer.tolist() == [-2] * len(buffer)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_common_token_mapping_refreshes_across_batch_totals():
+    buffer = torch.full((16,), -1, dtype=torch.int32, device="cuda")
+    for starts in ([0, 2, 5], [0, 0, 3], [0, 0, 0], [0, 4, 6]):
+        common = _mapping_metadata(starts, 8)
+        actual = common.token_to_req_indices(buffer)
+        expected = [
+            request
+            for request in range(len(starts) - 1)
+            for _ in range(starts[request + 1] - starts[request])
+        ]
+        assert actual.tolist() == expected + [0] * (8 - starts[-1])
+        assert actual.data_ptr() == buffer.data_ptr()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_common_token_mapping_replays_device_splits_with_stale_cpu_cache():
+    """Replay refreshes the cached buffer without rereading CPU request splits."""
+    buffer = torch.empty(8, dtype=torch.int32, device="cuda")
+    warmup = _mapping_metadata([0, 2, 2, 6], 8)
+    warmup.token_to_req_indices(buffer)
+    torch.accelerator.synchronize()
+    common = _mapping_metadata([0, 2, 2, 6], 8)
+    unused_buffer = torch.full_like(buffer, -1)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mapped = common.token_to_req_indices(buffer)
+        reused = common.token_to_req_indices(unused_buffer)
+    assert reused.data_ptr() == mapped.data_ptr() == buffer.data_ptr()
+    for starts in ([0, 1, 5, 6], [0, 0, 6, 6], [0, 3, 3, 6]):
+        common.query_start_loc.copy_(torch.tensor(starts, device="cuda"))
+        graph.replay()
+        expected = [
+            request
+            for request in range(3)
+            for _ in range(starts[request + 1] - starts[request])
+        ]
+        assert mapped.tolist() == expected + [0, 0]
+        assert common.token_to_req_indices(unused_buffer).tolist() == expected + [0, 0]
+        assert common.query_start_loc_cpu.tolist() == [0, 2, 2, 6]
+        assert unused_buffer.tolist() == [-1] * 8
+
+
 def test_indexer_warmup_normalizes_zero_compress_ratios():
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8),
