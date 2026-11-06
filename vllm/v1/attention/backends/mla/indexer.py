@@ -842,8 +842,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        # Only decode tokens are expanded; prefill uses the request block table.
+        max_decode_tokens = min(
+            scheduler_config.max_num_seqs * next_n,
+            scheduler_config.max_num_batched_tokens,
+        )
         self.expanded_block_table_buffer = torch.zeros(
-            (scheduler_config.max_num_batched_tokens, block_table_width),
+            (max_decode_tokens, block_table_width),
             dtype=torch.int32,
             device=self.device,
         )
@@ -1186,6 +1191,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
         decode_metadata = None
         if num_decodes > 0:
+            assert num_decode_tokens <= self.expanded_block_table_buffer.shape[0]
             torch.diff(
                 common_attn_metadata.query_start_loc[: num_decodes + 1],
                 out=self.decode_lens_buffer[:num_decodes],

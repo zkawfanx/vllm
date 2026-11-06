@@ -647,6 +647,9 @@ def sparse_attn_indexer(
                 row_starts=chunk.cu_seqlen_ks,
             )
 
+            # Do not overlap this chunk's logits with the next allocation.
+            del logits
+
             if chunk.shard_row_counts is not None:
                 # TP query-sharding: this rank filled only its own rows of the
                 # chunk. Reassemble the full chunk from every rank's rows.
