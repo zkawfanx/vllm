@@ -12,6 +12,7 @@ import torch
 
 import vllm.v1.core.kv_cache_manager as kv_cache_manager
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
+from vllm.config import SpeculativeConfig
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -2618,38 +2619,35 @@ def test_emit_cached_block_events_zero_cached():
     assert pool.take_events() == []
 
 
-def test_eagle_enabled_removes_last_block():
-    """Verify Eagle does NOT remove blocks when request
-    length is divisible by block size."""
+@pytest.mark.parametrize(
+    "method", ["eagle", "eagle3", "mtp", "dflash", "dspark", "ngram"]
+)
+@pytest.mark.parametrize("extra_tokens", [0, 5])
+def test_speculative_prefix_reuse(method, extra_tokens):
+    """Only next-token-dependent draft KV loses an additional cached block."""
     block_size = 16
+    config = SpeculativeConfig(method="ngram", num_speculative_tokens=3)
+    config.method = method
     manager = make_kv_cache_manager(
         make_kv_cache_config(block_size, num_blocks=10),
         max_model_len=8192,
         enable_caching=True,
-        use_eagle=True,
+        use_eagle=config.needs_eagle_block_drop(),
         hash_block_size=block_size,
     )
-
-    # Request with 3 full blocks (48 tokens)
-    token_ids = [0] * (3 * block_size)
-    req = make_request("divisible_request", token_ids, block_size, sha256)
-
-    # Prime the cache
-    computed_blocks, _, _ = manager.get_computed_blocks(req)
-    manager.allocate_slots(
-        req, len(token_ids), len(computed_blocks.blocks[0]) * 16, computed_blocks
-    )
+    token_ids = list(range(3 * block_size + extra_tokens))
+    req = make_request("prime", token_ids, block_size, sha256)
+    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req)
+    manager.allocate_slots(req, len(token_ids), num_tokens, computed_blocks)
     manager.free(req)
 
-    # New request with same tokens + Eagle enabled
-    req_eagle = make_request("eagle_divisible", token_ids, block_size, sha256)
-    computed_blocks, num_tokens, _ = manager.get_computed_blocks(req_eagle)
-
-    # Should retain 1 block:
-    # 1. Original 3 blocks → pop last hash → 2 matched blocks
-    # 2. drop last matched block → 1 remaining block
-    assert len(computed_blocks.blocks[0]) == 1
-    assert num_tokens == 1 * block_size  # 16 tokens
+    reused = make_request("reuse", token_ids, block_size, sha256)
+    computed_blocks, num_tokens, _ = manager.get_computed_blocks(reused)
+    # One token must always be recomputed for logits, even without draft block drop.
+    expected_blocks = (len(token_ids) - 1) // block_size
+    expected_blocks -= int(method in ("eagle", "eagle3", "mtp"))
+    assert len(computed_blocks.blocks[0]) == expected_blocks
+    assert num_tokens == expected_blocks * block_size
 
 
 def test_eagle_with_partial_blocks():
