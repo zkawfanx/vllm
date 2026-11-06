@@ -6,6 +6,7 @@ import functools
 from collections.abc import Sequence
 from dataclasses import replace
 
+from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
     _dsml_arg_converter,
@@ -16,6 +17,8 @@ from vllm.parser.deepseek_v4 import (
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
 
 DSML_TOOL_START = "<｜DSML｜ calls>"
+# V4's ``tool_calls`` wrapper name with V4.1's spacing (#62051).
+DSML_TOOL_START_ALT = "<｜DSML｜ tool_calls>"
 DSML_TOOL_END = "</｜DSML｜ calls>"
 DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
 DSML_INVOKE_END = "</｜DSML｜ invoke>"
@@ -43,7 +46,21 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
         config,
         name="deepseek_v41",
         turn_boundary_tokens=DEEPSEEK_TURN_BOUNDARY_TOKENS,
-        terminals={**config.terminals, **terminal_overrides},
+        terminals={
+            **config.terminals,
+            **terminal_overrides,
+            "TOOL_START_ALT": DSML_TOOL_START_ALT,
+        },
+        # This fork's lexer accepts one spelling per terminal. Reuse the
+        # canonical opener's transitions without changing token-ID matching.
+        transitions={
+            **config.transitions,
+            **{
+                (state, "TOOL_START_ALT"): transition
+                for (state, terminal), transition in config.transitions.items()
+                if terminal == "TOOL_START"
+            },
+        },
         token_id_terminals={
             key: terminal_overrides.get(key, value)
             for key, value in config.token_id_terminals.items()
@@ -73,6 +90,10 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
             chat_kwargs["thinking"] = True
         kwargs["chat_template_kwargs"] = chat_kwargs
         super().__init__(tokenizer, tools, **kwargs)
+
+    def finish_streaming(self) -> DeltaMessage | None:
+        # A final partial terminal can follow whitespace deferred during streaming.
+        return self._strip_trailing_reasoning(super().finish_streaming())
 
     def count_reasoning_tokens(self, token_ids: Sequence[int]) -> int:
         """Count tokens in an implicitly opened V4.1 reasoning block."""
