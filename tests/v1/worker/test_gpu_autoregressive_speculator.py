@@ -116,7 +116,9 @@ def test_decode_sampling_uses_unclamped_sampling_positions(monkeypatch):
     speculator.current_draft_step = torch.tensor(1)
     speculator.draft_logits = None
     speculator.draft_tokens = torch.zeros(2, 3, dtype=torch.int64)
-    speculator.max_model_len = 8
+    speculator.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(max_model_len=8)
+    )
     speculator.num_speculative_steps = 3
     speculator._prepare_eplb_forward = lambda *args: None
     speculator.sample_draft = lambda hidden, positions, *args: positions
