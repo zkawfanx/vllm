@@ -1249,7 +1249,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 self.decode_shard_min_reqs,
             )
 
-            seq_lens_is_buffer_view = not use_native or next_n > 1
+            seq_lens_is_buffer_view = next_n > 1 if use_native else max_decode_len > 1
 
             # DCP: localize the now-expanded per-token global bounds to this
             # rank's owned KV. Done here (after expansion) so each token's global
