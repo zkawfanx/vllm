@@ -485,3 +485,83 @@ def test_nested_decorated_op_runs_inline(cuda_capture_stream):
     # 0 -> +2 -> +1 (inner) -> +10 (outer) -> +100 = 113
     assert torch.equal(x, torch.full((4,), 113.0, device="cuda"))
     assert inner_calls == 2  # replay invokes the outer's lambda again
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_nested_wrapper_replay_survives_shared_pool_reuse(cuda_capture_stream, dtype):
+    """Nested outputs keep exact values across sizes without another forward."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode, VllmConfig
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    sizes = [96, 64, 32, 16, 8, 2, 1]
+    replay_sizes = [1, 96, 8, 64, 16, 32, 2] * 2
+    config = VllmConfig()
+    forward_calls = 0
+    eager_calls = 0
+
+    @eager_break_during_capture
+    def eager_step(aux, buffer):
+        nonlocal eager_calls
+        eager_calls += 1
+        torch.add(aux, 3, out=buffer)
+
+    def forward(x, buffer):
+        nonlocal forward_calls
+        forward_calls += 1
+        aux = x * 2
+        eager_step(aux, buffer)
+        hidden = buffer * 5
+        tail = hidden + 7
+        return hidden, [aux, {"tail": tail}]
+
+    wrapper = BreakableCUDAGraphWrapper(forward, config)
+    wrapper.graph_pool = torch.cuda.graph_pool_handle()
+    inputs = {n: torch.ones((n, 32), dtype=dtype, device="cuda") for n in sizes}
+    buffers = {n: torch.empty_like(inputs[n]) for n in sizes}
+    for n in sizes:
+        forward(inputs[n], buffers[n])
+    cuda_capture_stream.synchronize()
+    try:
+        for n in sizes:
+            with set_forward_context(
+                None,
+                config,
+                num_tokens=n,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ):
+                wrapper(inputs[n], buffers[n])
+            capture = wrapper.entries[BatchDescriptor(n)].capture
+            assert capture is not None
+            assert capture.num_graphs == 2
+            assert capture.num_eager_breaks == 1
+        captured_calls = forward_calls
+        captured_eager_calls = eager_calls
+        assert captured_calls == 2 * len(sizes)
+        for value, n in enumerate(replay_sizes, start=1):
+            inputs[n].fill_(value)
+            with set_forward_context(
+                None,
+                config,
+                num_tokens=n,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ):
+                hidden, nested = wrapper(inputs[n], buffers[n])
+            cuda_capture_stream.synchronize()
+            aux, mapping = nested
+            for tensor, expected in (
+                (aux, value * 2),
+                (hidden, (value * 2 + 3) * 5),
+                (mapping["tail"], (value * 2 + 3) * 5 + 7),
+            ):
+                assert tensor.shape == (n, 32)
+                assert tensor.dtype == dtype
+                assert torch.equal(tensor, torch.full_like(tensor, expected))
+            del hidden, nested, aux, mapping, tensor
+            assert forward_calls == captured_calls
+        assert eager_calls == captured_eager_calls + len(replay_sizes)
+    finally:
+        wrapper.clear_graphs()
