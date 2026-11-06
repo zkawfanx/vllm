@@ -193,3 +193,108 @@ def test_get_dummy_block_tables_returns_zeroed_rows():
     assert (dummy[0] == 0).all()
     # CUDA graph invariant: same persistent tensor, not a fresh allocation.
     assert dummy[0].data_ptr() == block_tables.input_block_tables[0].data_ptr()
+
+
+@pytest.mark.parametrize("uva_target", [False, True])
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+def test_staged_write_typed_inputs_and_ownership(uva_target, dtype):
+    """Copied iterables and borrowed arrays interleave without changing row order."""
+    import array
+    import gc
+
+    import numpy as np
+
+    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+
+    state = StagedWriteTensor(
+        (8, 8), dtype, torch.device("cuda"), uva_instead_of_gpu=uva_target
+    )
+    for base in (0, 100):
+        values = [base + 1, base + 2]
+        state.stage_write(0, 1, values)
+        values[:] = [-1, -1]  # Lists are snapshots, not borrowed buffers.
+        owner = torch.arange(base + 3, base + 7, dtype=torch.int64)
+        state.stage_write(1, 0, owner.numpy()[::2])
+        del owner
+        gc.collect()  # A NumPy view must retain its tensor storage until apply.
+        state.stage_write(2, 2, (v for v in range(base + 7, base + 9)))
+        state.stage_write(3, 1, array.array("i", [base + 9, base + 10]))
+        state.stage_write_elem(4, base + 11)
+        state.stage_write(4, 1, {0: base + 12, 1: base + 13}.values())
+        state.stage_write(5, 0, np.array([], dtype=np.int64))
+        state.stage_write(5, 0, iter(()))
+        state.stage_write(6, 0, np.array([base + 14], dtype=np.int64))
+        if dtype == torch.float32:
+            state.stage_write(7, 0, {0: 0.25, 1: -0.5}.values())
+        state.apply_write()
+        # The consumer is ordered on the same stream, before host synchronization.
+        result = state.gpu.clone()
+        torch.accelerator.synchronize()
+        expected = torch.zeros((8, 8), dtype=dtype)
+        expected[0, 1:3] = torch.tensor([base + 1, base + 2])
+        expected[1, :2] = torch.tensor([base + 3, base + 5])
+        expected[2, 2:4] = torch.tensor([base + 7, base + 8])
+        expected[3, 1:3] = torch.tensor([base + 9, base + 10])
+        expected[4, :3] = torch.tensor([base + 11, base + 12, base + 13])
+        expected[6, 0] = base + 14
+        if dtype == torch.float32:
+            expected[7, :2] = torch.tensor([0.25, -0.5])
+        torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+
+    state.stage_write(0, 0, np.arange(6, dtype=np.int64)[::2])
+    state.apply_write()
+    torch.accelerator.synchronize()
+    assert state.gpu[0, :3].tolist() == [0, 2, 4]
+
+
+def test_fused_staged_write_typed_chunks():
+    import array
+
+    import numpy as np
+
+    from vllm.v1.worker.gpu.buffer_utils import FusedStagedWriter, StagedWriteTensor
+
+    device = torch.device("cuda")
+    tables = [StagedWriteTensor((4, 8), torch.int32, device) for _ in range(2)]
+    writer = FusedStagedWriter(device, max_writes=8)
+    ptrs = torch.tensor(
+        [t.gpu.data_ptr() for t in tables], dtype=torch.uint64, device=device
+    )
+    strides = torch.tensor([t.gpu.stride(0) for t in tables], device=device)
+    for base in (0, 100):
+        for i, t in enumerate(tables):
+            b = base + 10 * i
+            t.stage_write(0, 0, [b + 1])
+            t.stage_write(1, 2, np.array([b + 2, b + 3], dtype=np.int64))
+            t.stage_write(2, 1, array.array("i", [b + 4]))
+            t.stage_write_elem(3, b + 5)
+        writer.apply(tables, ptrs, strides)
+        torch.accelerator.synchronize()
+        for i, t in enumerate(tables):
+            b = base + 10 * i
+            expected = torch.zeros((4, 8), dtype=torch.int32)
+            expected[0, 0] = b + 1
+            expected[1, 2:4] = torch.tensor([b + 2, b + 3])
+            expected[2, 1] = b + 4
+            expected[3, 0] = b + 5
+            torch.testing.assert_close(t.gpu.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("uva_target", [False, True])
+def test_staged_write_snapshots_pinned_source_before_return(uva_target):
+    from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor
+
+    state = StagedWriteTensor(
+        (1, 4),
+        torch.int32,
+        torch.device("cuda"),
+        uva_instead_of_gpu=uva_target,
+    )
+    source = torch.tensor([1, 2, 3, 4], dtype=torch.int32).pin_memory()
+    state.stage_write(0, 0, source.numpy())
+    # Keep H2D pending while the caller reuses its pinned storage after apply.
+    torch.cuda._sleep(10_000_000)
+    state.apply_write()
+    source.fill_(99)
+    torch.accelerator.synchronize()
+    assert state.gpu[0].tolist() == [1, 2, 3, 4]
