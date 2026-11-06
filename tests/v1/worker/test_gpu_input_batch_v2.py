@@ -92,6 +92,41 @@ def high_row_inputs(high_row_device):
     return tokens, batch.idx_mapping[[0, _HIGH_ROW]]
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64, torch.float32])
+@pytest.mark.parametrize("uva_instead_of_gpu", [False, True])
+def test_staged_write_chunks_preserve_ranges_and_reset(dtype, uva_instead_of_gpu):
+    """Mixed-length writes must not overwrite gaps or retain old chunk counts."""
+    staged = StagedWriteTensor(
+        (4, 4096), dtype, torch.device("cuda"), uva_instead_of_gpu=uva_instead_of_gpu
+    )
+    values = list(range(2500))
+    staged.stage_write(0, 3, iter(values))
+    staged.stage_write(1, 2, [7])
+    staged.stage_write(2, 0, iter(()))
+    staged.stage_write(3, 0, [])
+    staged.apply_write()
+    staged.stage_write(0, 3, [9])
+    staged.apply_write()
+    # The next GPU consumer must observe writes without a host synchronization.
+    observed = staged.gpu.clone()
+    expected = torch.zeros_like(staged.gpu)
+    expected[0, 3:2503] = torch.tensor(values, dtype=dtype, device="cuda")
+    expected[0, 3] = 9
+    expected[1, 2] = 7
+    assert torch.equal(observed, expected)
+    assert staged._staged_write_max_len == 0
+
+    staged.stage_write_elem(0, 9)
+    staged.apply_write()
+    staged.stage_write(2, 0, iter(()))
+    staged.apply_write()
+    staged.apply_write()
+    observed = staged.gpu.clone()
+    expected[0, 0] = 9
+    assert torch.equal(observed, expected)
+
+
 def test_staged_write_preserves_large_row_offsets(high_row_device):
     """An int32 staged index must not wrap when multiplied by its row stride."""
     staged = StagedWriteTensor((_NUM_ROWS, _ROW_STRIDE), torch.int32, high_row_device)
