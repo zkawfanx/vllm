@@ -18,11 +18,10 @@ import torch
 def _enable_breakable_cudagraph(monkeypatch: pytest.MonkeyPatch):
     """Enable breakable cudagraphs for this module's tests only.
 
-    eager_break_during_capture reads the env at decoration time, which
-    happens inside the test bodies, so a per-test fixture suffices.
-    monkeypatch restores the env so other test files running in the same
-    pytest process are unaffected (a module-level os.environ assignment
-    used to leak into test_cudagraph_dispatch.py and break it).
+    A per-test fixture suffices. monkeypatch restores the env so other
+    test files running in the same pytest process are unaffected (a
+    module-level os.environ assignment used to leak into
+    test_cudagraph_dispatch.py and break it).
     """
     import vllm.envs as envs
 
@@ -133,6 +132,102 @@ def test_decorator_passthrough_outside_capture():
     assert calls == [3]
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_decorator_passthrough_returns_fn_result(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+):
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+    if not enabled:
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+    sentinel = object()
+
+    @eager_break_during_capture
+    def f():
+        return sentinel
+
+    assert f() is sentinel
+
+
+@pytest.mark.parametrize("set_env_after_decoration", [False, True])
+def test_decorator_breaks_when_enabled_after_decoration(
+    monkeypatch: pytest.MonkeyPatch,
+    set_env_after_decoration: bool,
+):
+    """VllmConfig can enable breakable cudagraphs after the decorated module
+    was imported (e.g. on a cold model-info cache); the op must still break."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphCapture,
+        eager_break_during_capture,
+    )
+
+    monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+
+    @eager_break_during_capture
+    def op(x):
+        return x + 1
+
+    if set_env_after_decoration:
+        monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", "1")
+
+    class _Capture:
+        _capturing = True
+
+        def __init__(self):
+            self.eager = []
+
+        def add_eager(self, fn):
+            self.eager.append(fn)
+            return fn()
+
+    capture = _Capture()
+    BreakableCUDAGraphCapture._tls.active = capture
+    assert op(1) == 2
+    assert len(capture.eager) == 1
+
+
+def test_attention_op_breaks_when_imported_before_enable(tmp_path):
+    """Importing the attention module before the flag is set must still yield
+    the breakable wrapper (functools.wraps copies __name__/__wrapped__, so
+    compare code objects)."""
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "VLLM_USE_BREAKABLE_CUDAGRAPH"}
+    env["VLLM_CACHE_ROOT"] = str(tmp_path)
+    code = (
+        "import vllm.model_executor.layers.attention.attention as a\n"
+        "import vllm.compilation.breakable_cudagraph as b\n"
+        "c = a.unified_attention_with_output.__code__\n"
+        "w = b.eager_break_during_capture(lambda: None).__code__\n"
+        "assert (c.co_filename, c.co_name) == (w.co_filename, w.co_name), c\n"
+    )
+    subprocess.run([sys.executable, "-c", code], env=env, check=True)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_decorated_op_traces_without_graph_break(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+):
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+
+    if not enabled:
+        monkeypatch.delenv("VLLM_USE_BREAKABLE_CUDAGRAPH")
+
+    @eager_break_during_capture
+    def op(x):
+        return x * 2 + 1
+
+    def f(x):
+        return op(x).sin()
+
+    torch._dynamo.reset()
+    x = torch.randn(4)
+    compiled = torch.compile(f, fullgraph=True, backend="eager")
+    torch.testing.assert_close(compiled(x), f(x))
+
+
 # ---------------------------------------------------------------------------
 # BreakableCUDAGraphCapture: thread-local + nested rejection
 # ---------------------------------------------------------------------------
@@ -143,6 +238,84 @@ def test_current_is_none_when_inactive():
 
     assert BreakableCUDAGraphCapture.current() is None
     assert BreakableCUDAGraphCapture.is_active() is False
+
+
+@pytest.mark.parametrize("resolved", [None, False, True])
+@pytest.mark.parametrize("env_enabled", [False, True])
+def test_breakable_cudagraph_reader_prefers_resolved_config(
+    monkeypatch, resolved, env_enabled
+):
+    from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+    from vllm.config import CompilationConfig
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(env_enabled)))
+    config = CompilationConfig(use_breakable_cudagraph=resolved)
+    expected = env_enabled if resolved is None else resolved
+    assert is_breakable_cudagraph_enabled(config) is expected
+    assert is_breakable_cudagraph_enabled() is env_enabled
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_breakable_cudagraph_dispatch_uses_resolved_config(monkeypatch, enabled):
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationConfig, CompilationMode, CUDAGraphMode
+    from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(
+            mode=CompilationMode.NONE,
+            cudagraph_mode=CUDAGraphMode.PIECEWISE,
+            use_breakable_cudagraph=enabled,
+        ),
+        num_speculative_tokens=0,
+        lora_config=None,
+    )
+    if enabled:
+        CudagraphDispatcher(config)
+    else:
+        with pytest.raises(AssertionError, match="Compilation mode"):
+            CudagraphDispatcher(config)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "graph_mode,has_piecewise",
+    [
+        ("NONE", False),
+        ("PIECEWISE", True),
+        ("FULL", False),
+        ("FULL_AND_PIECEWISE", True),
+    ],
+)
+def test_breakable_cudagraph_manager_uses_resolved_config(
+    monkeypatch, enabled, graph_mode, has_piecewise
+):
+    from types import SimpleNamespace
+
+    from vllm.config import CompilationConfig, CUDAGraphMode
+    from vllm.v1.worker.gpu import cudagraph_utils
+
+    monkeypatch.setenv("VLLM_USE_BREAKABLE_CUDAGRAPH", str(int(not enabled)))
+    monkeypatch.setattr(
+        cudagraph_utils,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        cudagraph_utils.current_platform, "get_global_graph_pool", lambda: None
+    )
+    mode = CUDAGraphMode[graph_mode]
+    config = SimpleNamespace(
+        compilation_config=CompilationConfig(use_breakable_cudagraph=enabled),
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        parallel_config=SimpleNamespace(data_parallel_size=1, tensor_parallel_size=1),
+    )
+
+    manager = cudagraph_utils.CudaGraphManager(config, torch.device("cpu"), mode, 1)
+
+    assert manager.use_breakable_cg is (enabled and has_piecewise)
 
 
 def test_thread_local_active_during_context(cuda_capture_stream):
@@ -485,3 +658,83 @@ def test_nested_decorated_op_runs_inline(cuda_capture_stream):
     # 0 -> +2 -> +1 (inner) -> +10 (outer) -> +100 = 113
     assert torch.equal(x, torch.full((4,), 113.0, device="cuda"))
     assert inner_calls == 2  # replay invokes the outer's lambda again
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_nested_wrapper_replay_survives_shared_pool_reuse(cuda_capture_stream, dtype):
+    """Nested outputs keep exact values across sizes without another forward."""
+    from vllm.compilation.breakable_cudagraph import (
+        BreakableCUDAGraphWrapper,
+        eager_break_during_capture,
+    )
+    from vllm.config import CUDAGraphMode, VllmConfig
+    from vllm.forward_context import BatchDescriptor, set_forward_context
+
+    sizes = [96, 64, 32, 16, 8, 2, 1]
+    replay_sizes = [1, 96, 8, 64, 16, 32, 2] * 2
+    config = VllmConfig()
+    forward_calls = 0
+    eager_calls = 0
+
+    @eager_break_during_capture
+    def eager_step(aux, buffer):
+        nonlocal eager_calls
+        eager_calls += 1
+        torch.add(aux, 3, out=buffer)
+
+    def forward(x, buffer):
+        nonlocal forward_calls
+        forward_calls += 1
+        aux = x * 2
+        eager_step(aux, buffer)
+        hidden = buffer * 5
+        tail = hidden + 7
+        return hidden, [aux, {"tail": tail}]
+
+    wrapper = BreakableCUDAGraphWrapper(forward, config)
+    wrapper.graph_pool = torch.cuda.graph_pool_handle()
+    inputs = {n: torch.ones((n, 32), dtype=dtype, device="cuda") for n in sizes}
+    buffers = {n: torch.empty_like(inputs[n]) for n in sizes}
+    for n in sizes:
+        forward(inputs[n], buffers[n])
+    cuda_capture_stream.synchronize()
+    try:
+        for n in sizes:
+            with set_forward_context(
+                None,
+                config,
+                num_tokens=n,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ):
+                wrapper(inputs[n], buffers[n])
+            capture = wrapper.entries[BatchDescriptor(n)].capture
+            assert capture is not None
+            assert capture.num_graphs == 2
+            assert capture.num_eager_breaks == 1
+        captured_calls = forward_calls
+        captured_eager_calls = eager_calls
+        assert captured_calls == 2 * len(sizes)
+        for value, n in enumerate(replay_sizes, start=1):
+            inputs[n].fill_(value)
+            with set_forward_context(
+                None,
+                config,
+                num_tokens=n,
+                cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE,
+            ):
+                hidden, nested = wrapper(inputs[n], buffers[n])
+            cuda_capture_stream.synchronize()
+            aux, mapping = nested
+            for tensor, expected in (
+                (aux, value * 2),
+                (hidden, (value * 2 + 3) * 5),
+                (mapping["tail"], (value * 2 + 3) * 5 + 7),
+            ):
+                assert tensor.shape == (n, 32)
+                assert tensor.dtype == dtype
+                assert torch.equal(tensor, torch.full_like(tensor, expected))
+            del hidden, nested, aux, mapping, tensor
+            assert forward_calls == captured_calls
+        assert eager_calls == captured_eager_calls + len(replay_sizes)
+    finally:
+        wrapper.clear_graphs()

@@ -640,6 +640,10 @@ class CompilationConfig:
     Warning: This flag is new and subject to change in addition
     more modes may be added.
     """
+    use_breakable_cudagraph: bool | None = None
+    """Resolved by VllmConfig from VLLM_USE_BREAKABLE_CUDAGRAPH or the
+    model architecture default. Stored per config and serialized to workers.
+    None is unresolved; standalone readers fall back to the environment."""
     cudagraph_num_of_warmups: int = 0
     """Number of warmup runs for cudagraph.
     It means the first several runs will be treated as warmup runs.

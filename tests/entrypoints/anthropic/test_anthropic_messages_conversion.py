@@ -13,11 +13,15 @@ Also covers cache usage computation in ``_build_anthropic_usage``.
 """
 
 import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from vllm.entrypoints.anthropic.protocol import (
+    AnthropicCountTokensRequest,
+    AnthropicCountTokensResponse,
     AnthropicMessagesRequest,
 )
 from vllm.entrypoints.anthropic.serving import (
@@ -38,6 +42,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     PromptTokenUsageInfo,
     UsageInfo,
 )
+from vllm.multimodal.cache import (
+    MultiModalProcessorOnlyCache,
+    MultiModalProcessorSenderCache,
+    MultiModalReceiverCache,
+)
+from vllm.multimodal.inputs import MultiModalKwargsItem
 
 _convert = AnthropicServingMessages._convert_anthropic_to_openai_request
 _img_url = AnthropicServingMessages._convert_image_source_to_url
@@ -328,6 +338,57 @@ class TestToolResultContent:
             "data:image/png;base64,IMG1",
             "https://example.com/img2.jpg",
         ]
+
+    @pytest.mark.parametrize("tool_use_id", ["call_001", None])
+    @pytest.mark.parametrize("mixed", [False, True], ids=["references", "mixed"])
+    def test_tool_references_stay_in_one_result(self, tool_use_id, mixed):
+        """References lead text, with images following the single tool message."""
+        content: list[dict[str, Any]] = [
+            {"type": "tool_reference", "tool_name": "get_weather"},
+            {"type": "tool_reference", "name": "get_time"},
+        ]
+        expected = [
+            {"type": "tool_reference", "name": "get_weather"},
+            {"type": "tool_reference", "name": "get_time"},
+        ]
+        if mixed:
+            content.insert(0, {"type": "text", "text": "2 tools found"})
+            content.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": "AAAA",
+                    },
+                }
+            )
+            content.append({"type": "text", "text": "Use one."})
+            expected.append({"type": "text", "text": "2 tools found\nUse one."})
+        request = self._make_tool_result_request(content)
+        blocks = request.messages[-1].content
+        assert isinstance(blocks, list)
+        blocks[0].tool_use_id = tool_use_id
+        original = request.model_dump()
+
+        for _ in range(2):
+            result = _convert(request)
+            assert [m["role"] for m in result.messages] == ["assistant", "tool"] + (
+                ["user"] if mixed else []
+            )
+            assert result.messages[1] == {
+                "role": "tool",
+                "tool_call_id": tool_use_id or "",
+                "content": expected,
+            }
+            if mixed:
+                assert result.messages[2]["content"] == [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,AAAA"},
+                    }
+                ]
+            assert request.model_dump() == original
 
     def test_tool_result_none_content(self):
         request = self._make_tool_result_request(None)
@@ -1385,3 +1446,99 @@ class TestMessagesFullConverter:
         assert len(result.content) == 1
         assert result.content[0].type == "text"
         assert result.content[0].text == ""
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/messages", "/v1/messages/count_tokens"])
+@pytest.mark.parametrize(
+    ("error", "status", "error_type"),
+    [
+        (ValueError("image special token is reserved"), 400, "BadRequestError"),
+        (RuntimeError("generation failed"), 500, "internal_error"),
+    ],
+)
+def test_anthropic_routes_classify_renderer_validation_errors(
+    endpoint, error, status, error_type
+):
+    """Renderer input errors use HTTP 400; server failures retain HTTP 500."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from vllm.entrypoints.anthropic.api_router import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.anthropic_serving_messages = SimpleNamespace(
+        create_messages=AsyncMock(side_effect=error),
+        count_tokens=AsyncMock(side_effect=error),
+        create_error_response=AnthropicServingMessages.create_error_response,
+    )
+    body: dict[str, Any] = {
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    if endpoint == "/v1/messages":
+        body["max_tokens"] = 16
+    with TestClient(app) as client:
+        response = client.post(endpoint, json=body)
+    assert response.status_code == status
+    assert response.json()["type"] == "error"
+    assert response.json()["error"]["type"] == error_type
+    assert response.json()["error"]["message"] == str(error)
+
+
+@pytest.mark.asyncio
+async def test_count_tokens_keeps_cold_media_available_for_generation(monkeypatch):
+    """Count-only requests must not create sender entries without receiver data."""
+    model_config = MagicMock()
+    model_config.get_multimodal_config.return_value.mm_processor_cache_gb = 1
+    sender = MultiModalProcessorSenderCache(model_config)
+    receiver = MultiModalReceiverCache(model_config)
+    readonly = MultiModalProcessorOnlyCache(model_config)
+    item = MultiModalKwargsItem.dummy()
+    rendered_data: list[MultiModalKwargsItem | None] = []
+
+    async def render_chat(request, *, skip_mm_cache=False):
+        cache = readonly if skip_mm_cache else sender
+        data, _ = cache.get_and_update_item((item, []), "cold-image")
+        rendered_data.append(data)
+        return [], [{"prompt_token_ids": [1, 2, 3]}]
+
+    serving = object.__new__(AnthropicServingMessages)
+    serving._merge_inline_system = False
+    monkeypatch.setattr(serving, "_check_model", AsyncMock(return_value=None))
+    serving.engine_client = MagicMock(errored=False)
+    serving.online_renderer = MagicMock(render_chat=render_chat)
+    request = AnthropicCountTokensRequest(
+        model="test-model",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": "https://example.com/cold.png",
+                        },
+                    }
+                ],
+            }
+        ],
+    )
+
+    for _ in range(2):
+        counted = await serving.count_tokens(request)
+        assert isinstance(counted, AnthropicCountTokensResponse)
+        assert counted.input_tokens == 3
+        assert not sender.is_cached_item("cold-image")
+
+    chat_request = _convert(request)
+    await serving.render_chat_request(chat_request)
+    assert rendered_data[-1] is item
+    assert receiver.get_and_update_item(rendered_data[-1], "cold-image") is item
+
+    # Counting a warm image must not disturb the ordinary IPC cache hit.
+    await serving.count_tokens(request)
+    await serving.render_chat_request(chat_request)
+    assert rendered_data[-1] is None
+    assert receiver.get_and_update_item(rendered_data[-1], "cold-image") is item

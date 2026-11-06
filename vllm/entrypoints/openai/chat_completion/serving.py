@@ -192,6 +192,8 @@ class OpenAIServingChat(GenerateBaseServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        *,
+        skip_mm_cache: bool = False,
     ) -> tuple[list[ConversationMessage], list[EngineInput]] | ErrorResponse:
         """
         Validate the model and preprocess a chat completion request.
@@ -214,7 +216,9 @@ class OpenAIServingChat(GenerateBaseServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.online_renderer.render_chat(request)
+        return await self.online_renderer.render_chat(
+            request, skip_mm_cache=skip_mm_cache
+        )
 
     async def create_chat_completion(
         self,
@@ -870,6 +874,8 @@ class OpenAIServingChat(GenerateBaseServing):
                 logprobs = None
 
             if parser is not None:
+                if final_res.prompt_token_ids is not None:
+                    parser.set_prompt_token_ids(final_res.prompt_token_ids)
                 reasoning, content, tool_calls = parser.parse(
                     output.text,
                     request,

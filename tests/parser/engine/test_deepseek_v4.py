@@ -33,9 +33,12 @@ from vllm.parser.deepseek_v4 import (
     DSML_TOOL_START,
     DeepSeekV4Parser,
     _dsml_arg_converter,
+    _dsml_arg_value_extender,
     _unwrap_wrapper_args,
     deepseek_v4_config,
 )
+from vllm.parser.deepseek_v32 import DeepSeekV32Parser
+from vllm.parser.deepseek_v41 import DeepSeekV41Parser
 from vllm.parser.engine.registered_adapters import (
     DeepSeekV4ParserReasoningAdapter,
     DeepSeekV4ParserToolAdapter,
@@ -1812,3 +1815,138 @@ class TestDelegatingParserLargeDelta:
         assert eos_text not in output.reasoning
         assert output.content == ""
         assert output.tool_calls == []
+
+
+# ── Open string values stream without re-running the converter (#52846) ──
+
+
+class TestArgValueExtender:
+    def test_stops_at_split_param_close(self):
+        extend = _dsml_arg_value_extender(
+            "<" + _PARAM_OPEN.format(name="k", is_str="true") + "x"
+        )
+        assert extend is not None
+        assert [extend(d) for d in ['a"\n', "</｜DSML｜para", "meter>"]] == [
+            'a\\"\\n',
+            "</｜DSML｜para",
+            None,
+        ]
+
+    @pytest.mark.parametrize(
+        "raw_args",
+        [
+            "<" + _PARAM_OPEN.format(name="k", is_str="true") + "x" + _PARAM_CLOSE,
+            "<" + _PARAM_OPEN.format(name="k", is_str="false") + "1",
+            "<"
+            + _PARAM_OPEN.format(name="k", is_str="true")
+            + "x"
+            + _PARAM_CLOSE
+            + "<"
+            + _PARAM_OPEN.format(name="k", is_str="true")
+            + "y",
+        ],
+        ids=["closed_value", "non_string_value", "repeated_key"],
+    )
+    def test_no_extender_unless_open_string_value(self, raw_args):
+        assert _dsml_arg_value_extender(raw_args) is None
+
+    @pytest.mark.parametrize(
+        "partial_tag", ['<｜DSML｜parameter name="j', "<｜DSML｜parameter na"]
+    )
+    def test_holds_back_partial_tag_after_gt(self, partial_tag):
+        raw_args = (
+            "<" + _PARAM_OPEN.format(name="k", is_str="true") + "a > b" + partial_tag
+        )
+        assert json.loads(_dsml_arg_converter(raw_args, True)) == {"k": "a > b"}
+        assert _dsml_arg_value_extender(raw_args) is None
+
+    def test_arms_on_value_ending_in_newline(self):
+        raw_args = "<" + _PARAM_OPEN.format(name="k", is_str="true") + "def f():\n"
+        assert json.loads(_dsml_arg_converter(raw_args, True)) == {"k": "def f():\n"}
+        assert _dsml_arg_value_extender(raw_args) is not None
+
+
+@pytest.mark.parametrize(
+    "parser_cls, wrapper, space",
+    [
+        (DeepSeekV4Parser, "tool_calls", ""),
+        (DeepSeekV32Parser, "function_calls", ""),
+        (DeepSeekV41Parser, "calls", " "),
+    ],
+)
+class TestIncrementalStringArguments:
+    def _stream(self, parser_cls, wrapper, space, body, size, schema_type="string"):
+        request = _test_request(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "emit",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"text": {"type": schema_type}},
+                        },
+                    },
+                }
+            ]
+        )
+        parser = parser_cls(
+            make_mock_tokenizer({}),
+            tools=request.tools,
+            chat_template_kwargs={"thinking": False},
+        )
+        converter = parser._arg_converter
+        conversions = 0
+
+        def counted(raw, partial):
+            nonlocal conversions
+            conversions += int(partial)
+            return converter(raw, partial)
+
+        parser._arg_converter = counted
+        marker = "｜DSML｜" + space
+        chunks = [
+            f'<{marker}{wrapper}>\n<{marker}invoke name="emit">\n'
+            f'<{marker}parameter name="text" string="true">',
+            *(body[i : i + size] for i in range(0, len(body), size)),
+            f"</{marker}parameter>\n</{marker}invoke>\n</{marker}{wrapper}>",
+        ]
+        fragments = []
+        for index, chunk in enumerate(chunks):
+            delta = parser.parse_delta(
+                chunk, [], request, finished=index == len(chunks) - 1
+            )
+            fragments.append(
+                "".join(
+                    call.function.arguments
+                    for call in (delta.tool_calls if delta else [])
+                    if call.function and call.function.arguments
+                )
+            )
+        return fragments, conversions
+
+    @pytest.mark.parametrize("size", [1, 7, 32])
+    def test_escaped_markup_streams_before_close(
+        self, parser_cls, wrapper, space, size
+    ):
+        body = '<div class="x">é \\ a > b</div>\n' * 16
+        fragments, _ = self._stream(parser_cls, wrapper, space, body, size)
+        assert sum(bool(fragment) for fragment in fragments[1:-1]) > 1
+        assert json.loads("".join(fragments)) == {"text": body}
+
+    def test_schema_coercion_withholds_string_value(self, parser_cls, wrapper, space):
+        body = "1" * 128
+        fragments, _ = self._stream(
+            parser_cls, wrapper, space, body, 7, schema_type="integer"
+        )
+        assert not any(fragments[1:-1])
+        assert json.loads("".join(fragments)) == {"text": int(body)}
+
+    def test_converter_calls_do_not_grow_with_body(self, parser_cls, wrapper, space):
+        calls = []
+        for lines in (20, 200):
+            body = 'if a > b: print("é\\n")\n' * lines
+            fragments, conversions = self._stream(parser_cls, wrapper, space, body, 7)
+            assert json.loads("".join(fragments)) == {"text": body}
+            calls.append(conversions)
+        assert calls[0] == calls[1]

@@ -711,3 +711,40 @@ def test_kv_pressure_preempt_mid_handoff(kv_role: str):
     else:
         assert handoff.is_finished()
         assert handoff.num_output_tokens == 1
+
+
+def test_skip_unused_drafts_after_async_all_rejected_steps(monkeypatch):
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        use_v2_model_runner=True,
+        num_speculative_tokens=3,
+        speculative_method="ngram_gpu",
+        max_num_batched_tokens=16,
+        max_model_len=128,
+    )
+    # The scheduler behavior is independent of the loaded draft checkpoint.
+    scheduler.can_skip_drafts = True
+    (request,) = create_requests(num_requests=1, num_tokens=32, max_tokens=5)
+    scheduler.add_request(request)
+    outputs = []
+    schedule = scheduler.schedule
+
+    def record_schedule():
+        output = schedule()
+        if request.request_id in output.num_scheduled_tokens:
+            outputs.append(output)
+        return output
+
+    monkeypatch.setattr(scheduler, "schedule", record_schedule)
+    engine = PipelinedEngine(scheduler, queue_size=2, accept_drafts=lambda *_: 0)
+    engine.run()
+
+    assert request.num_output_tokens == 5
+    assert request.num_output_placeholders == 0
+    assert scheduler.get_num_unfinished_requests() == 0
+    assert outputs[0].skip_drafts  # non-final chunk
+    assert not outputs[1].skip_drafts  # final prefill still needs drafts
+    assert any(output.scheduled_spec_decode_tokens for output in outputs[2:])
+    assert all(not output.skip_drafts for output in outputs[1:-1])
+    assert outputs[-1].skip_drafts  # guaranteed final output, even at zero acceptance
+    assert len(engine.emitted[request.request_id]) == 5

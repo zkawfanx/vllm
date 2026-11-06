@@ -9,6 +9,7 @@ from dataclasses import replace
 from vllm.parser.deepseek_v4 import (
     DeepSeekV4Parser,
     _dsml_arg_converter,
+    _dsml_arg_value_extender,
     _param_patterns,
     deepseek_v4_config,
 )
@@ -20,6 +21,7 @@ DSML_INVOKE_PREFIX = '<｜DSML｜ invoke name="'
 DSML_INVOKE_END = "</｜DSML｜ invoke>"
 DSML_PARAM_START = "<｜DSML｜ parameter"
 DSML_PARAM_CLOSE = "</｜DSML｜ parameter>"
+DEEPSEEK_TURN_BOUNDARY_TOKENS = frozenset({"<｜User｜>", "<｜Assistant｜>"})
 
 _PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(
     DSML_PARAM_START, DSML_PARAM_CLOSE, implicit_close=True
@@ -40,6 +42,7 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
     return replace(
         config,
         name="deepseek_v41",
+        turn_boundary_tokens=DEEPSEEK_TURN_BOUNDARY_TOKENS,
         terminals={**config.terminals, **terminal_overrides},
         token_id_terminals={
             key: terminal_overrides.get(key, value)
@@ -49,6 +52,14 @@ def deepseek_v41_config(thinking: bool = False) -> ParserEngineConfig:
             _dsml_arg_converter,
             param_re=_PARAM_RE,
             partial_param_re=_PARTIAL_PARAM_RE,
+            param_start=DSML_PARAM_START,
+        ),
+        arg_value_extender=functools.partial(
+            _dsml_arg_value_extender,
+            param_re=_PARAM_RE,
+            partial_param_re=_PARTIAL_PARAM_RE,
+            param_start=DSML_PARAM_START,
+            param_close=DSML_PARAM_CLOSE,
         ),
     )
 
@@ -73,7 +84,7 @@ class DeepSeekV41Parser(DeepSeekV4Parser):
         if end_id is None:
             return 0
 
-        in_reasoning = True
+        in_reasoning = not self._prompt_closes_reasoning
         count = 0
         for token_id in token_ids:
             if start_id is not None and token_id == start_id:

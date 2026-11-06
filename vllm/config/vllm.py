@@ -1003,7 +1003,45 @@ class VllmConfig:
         self.engram_config.verify_model_config(model_config)
         self.engram_config.verify_parallel_config(self.parallel_config)
 
-    def __post_init__(self):
+    def _maybe_enable_breakable_cudagraph(self) -> bool:
+        # Preserve the existing architecture defaults without changing the
+        # environment shared by other engines in this process.
+        if "VLLM_USE_BREAKABLE_CUDAGRAPH" in os.environ:
+            enabled = envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+        elif self.model_config is not None and any(
+            a
+            in (
+                "DeepseekV4ForCausalLM",
+                "DeepseekV41ForCausalLM",
+                "DeepSeekV4MTPModel",
+                "InklingForCausalLM",
+                "InklingForConditionalGeneration",
+                "KimiK3ForConditionalGeneration",
+                "KimiK3MTPModel",
+                "KimiLinearForCausalLM",
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+            )
+            for a in self.model_config.architectures
+        ):
+            enabled = True
+            logger.info_once(
+                "Auto-enabling breakable CUDA graphs for this config. "
+                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
+            )
+        else:
+            enabled = False
+
+        self.compilation_config.use_breakable_cudagraph = enabled
+        if enabled:
+            logger.warning_once(
+                "Breakable CUDA graphs are enabled, disabling vLLM's "
+                "torch.compile pipeline. Equivalent to -cc.mode=none."
+            )
+            self.compilation_config.mode = CompilationMode.NONE
+        return enabled
+
+    def __post_init__(self, *, resolve_breakable_cudagraph: bool = True):
         """Verify configs are valid & consistent with each other."""
 
         # To give each torch profile run a unique instance name.
@@ -1240,41 +1278,11 @@ class VllmConfig:
             )
             self.compilation_config.mode = CompilationMode.NONE
 
-        # For model classes don't carry @support_torch_compile —
-        # the breakable cudagraph is the supported PIECEWISE path. Auto-enable
-        # it unless the user has explicitly opted out via the env var.
         if (
-            self.model_config is not None
-            and "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ
-            and any(
-                a
-                in (
-                    "DeepseekV4ForCausalLM",
-                    "DeepseekV41ForCausalLM",
-                    "DeepSeekV4MTPModel",
-                    "InklingForCausalLM",
-                    "InklingForConditionalGeneration",
-                    "KimiK3ForConditionalGeneration",
-                    "KimiK3MTPModel",
-                    "KimiLinearForCausalLM",
-                    "MiniMaxM3SparseForCausalLM",
-                    "MiniMaxM3SparseForConditionalGeneration",
-                )
-                for a in self.model_config.architectures
-            )
+            resolve_breakable_cudagraph
+            or self.compilation_config.use_breakable_cudagraph is None
         ):
-            os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
-            logger.info_once(
-                "Auto-enabling VLLM_USE_BREAKABLE_CUDAGRAPH=1. "
-                "Set VLLM_USE_BREAKABLE_CUDAGRAPH=0 to opt out."
-            )
-
-        if envs.VLLM_USE_BREAKABLE_CUDAGRAPH:
-            logger.warning_once(
-                "VLLM_USE_BREAKABLE_CUDAGRAPH is set, disabling vLLM's "
-                "torch.compile pipeline. Equivalent to -cc.mode=none."
-            )
-            self.compilation_config.mode = CompilationMode.NONE
+            self._maybe_enable_breakable_cudagraph()
 
         if self.compilation_config.backend == "eager" or (
             self.compilation_config.mode is not None
@@ -1346,7 +1354,7 @@ class VllmConfig:
         if (
             self.compilation_config.cudagraph_mode.requires_piecewise_compilation()
             and self.compilation_config.mode != CompilationMode.VLLM_COMPILE
-            and not envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+            and not self.compilation_config.use_breakable_cudagraph
         ):
             logger.info_once(
                 "Cudagraph mode %s is not compatible with compilation mode %s."
@@ -1587,7 +1595,7 @@ class VllmConfig:
             if self.compilation_config.cudagraph_mode.requires_piecewise_compilation():
                 assert (
                     self.compilation_config.mode == CompilationMode.VLLM_COMPILE
-                    or envs.VLLM_USE_BREAKABLE_CUDAGRAPH
+                    or self.compilation_config.use_breakable_cudagraph
                 ), (
                     "Compilation mode should be CompilationMode.VLLM_COMPILE "
                     "when cudagraph_mode piecewise cudagraphs is used, "

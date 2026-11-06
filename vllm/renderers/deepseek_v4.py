@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+from typing import cast
+
 from vllm.config import VllmConfig
 from vllm.entrypoints.chat_utils import (
     ChatCompletionMessageParam,
@@ -92,6 +95,36 @@ class DeepseekV4Renderer(BaseRenderer[DeepseekV4Tokenizer]):
 
 
 class DeepseekV41Renderer(DeepseekV4Renderer):
+    @staticmethod
+    def _materialize_messages(
+        messages: list[ChatCompletionMessageParam],
+    ) -> list[ChatCompletionMessageParam]:
+        copied = [dict(message) for message in messages]
+        for message in copied:
+            tool_calls = message.get("tool_calls")
+            if tool_calls is not None:
+                message["tool_calls"] = copy.deepcopy(list(tool_calls))
+            content = message.get("content")
+            if content is not None and not isinstance(content, str):
+                message["content"] = list(content)
+        return cast(list[ChatCompletionMessageParam], copied)
+
+    def render_messages(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        params: ChatParams,
+    ) -> tuple[list[ConversationMessage], DictPrompt]:
+        return super().render_messages(self._materialize_messages(messages), params)
+
+    async def render_messages_async(
+        self,
+        messages: list[ChatCompletionMessageParam],
+        params: ChatParams,
+    ) -> tuple[list[ConversationMessage], DictPrompt]:
+        return await super().render_messages_async(
+            self._materialize_messages(messages), params
+        )
+
     def _apply_chat_template(self, *args, **kwargs):
         image_order: list[int] = []
         kwargs["image_order"] = image_order

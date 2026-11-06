@@ -148,12 +148,17 @@ def test_indexer_builder_deepseek_v4_compressed_slot_mapping_uses_storage_block_
         "expected_compressed_max",
     ),
     [
+        (2, 1, 1, 0, 0),
         (1, 1031, 1031, 1031, 1031),
         (4, 1031, 1031, 257, 257),
         (128, 131071, 131071, 1023, 1023),
         (4, 131072, 262400, 32768, 65600),
         (128, 131072, 262400, 1024, 2050),
     ],
+)
+@pytest.mark.parametrize(
+    "num_speculative_tokens,use_flattening",
+    [(0, False), (5, False), (5, True)],
 )
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_indexer_decode_max_seq_len_matches_compressed_lengths(
@@ -162,8 +167,10 @@ def test_indexer_decode_max_seq_len_matches_compressed_lengths(
     max_seq_len: int,
     expected_compressed_len: int,
     expected_compressed_max: int,
+    num_speculative_tokens: int,
+    use_flattening: bool,
 ):
-    """Decode bounds and lengths must use compressed cache coordinates."""
+    """Compressed decode bounds must preserve shared uncompressed lengths."""
     device = torch.device("cuda")
     kv_cache_spec = MLAAttentionSpec(
         block_size=256,
@@ -175,6 +182,9 @@ def test_indexer_decode_max_seq_len_matches_compressed_lengths(
     # Keep this metadata regression independent of model-registry subprocesses
     # and compiled attention extensions. The builder only needs these fields.
     vllm_config = _make_indexer_test_config(max_model_len=max_seq_len)
+    vllm_config.speculative_config = SimpleNamespace(
+        num_speculative_tokens=num_speculative_tokens
+    )
     max_num_blocks = kv_cache_spec.max_num_blocks_per_req(vllm_config, max_seq_len)
     block_table_width = get_block_table_width(max_num_blocks, kv_cache_spec.block_size)
     builder = DeepseekV32IndexerMetadataBuilder(
@@ -184,6 +194,7 @@ def test_indexer_decode_max_seq_len_matches_compressed_lengths(
         device=device,
         block_table_width=block_table_width,
     )
+    builder.use_flattening = use_flattening
 
     query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)

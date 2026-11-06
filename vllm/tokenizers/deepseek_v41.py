@@ -29,7 +29,7 @@ def _normalize_messages(
     messages: list[ChatCompletionMessageParam],
 ) -> list[dict[str, Any]]:
     # vLLM additions to the reference: Responses API part types, image_pil,
-    # and ValueError (400) instead of the reference's asserts.
+    # tool_reference, and ValueError (400) instead of the reference's asserts.
     result = [dict(message) for message in copy.deepcopy(messages)]
     image_idx = 0
     for message in result:
@@ -54,12 +54,18 @@ def _normalize_messages(
                     parts.append(IMAGE_PLACEHOLDER)
                     image_indices.append(image_idx)
                     image_idx += 1
+                elif part_type == "tool_reference":
+                    # The system prompt already lists every tool, deferred
+                    # ones included, so the name is all the model needs.
+                    _reject_image_placeholder(block.get("name"))
+                    parts.append(block.get("name", ""))
                 else:
                     raise ValueError(
                         "DeepSeek V4.1 supports text and image content only; "
                         f"got {part_type!r}"
                     )
             message["content"] = "\n\n".join(parts)
+
     return result
 
 
@@ -110,6 +116,8 @@ def get_deepseek_v41_tokenizer(tokenizer: HfTokenizer) -> HfTokenizer:
                 drop_thinking=kwargs.get("drop_thinking", True),
                 reasoning_effort=effort,
                 image_order=image_order,
+                add_generation_prompt=kwargs.get("add_generation_prompt", True),
+                continue_final_message=kwargs.get("continue_final_message", False),
             )
             if kwargs.get("tokenize", True):
                 tokenizer_kwargs = {

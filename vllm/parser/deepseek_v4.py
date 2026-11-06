@@ -28,6 +28,7 @@ import regex as re
 from vllm.parser.engine.events import EventType
 from vllm.parser.engine.parser_engine import ParserEngine
 from vllm.parser.engine.parser_engine_config import (
+    ArgValueExtender,
     ParserEngineConfig,
     ParserState,
     Transition,
@@ -63,11 +64,25 @@ def _param_patterns(
     end = rf"(?:{close}|(?={start}\s+name=))" if implicit_close else close
     return (
         re.compile(rf"{head}(.*?){end}", re.DOTALL),
-        re.compile(rf"{head}(.*)$", re.DOTALL),
+        re.compile(rf"{head}(.*)\Z", re.DOTALL),
     )
 
 
 _PARAM_RE, _PARTIAL_PARAM_RE = _param_patterns(DSML_PARAM_START, DSML_PARAM_CLOSE)
+
+
+def _match_open_param(
+    raw_args: str, pos: int, partial_param_re: re.Pattern, param_start: str
+) -> tuple[str, str | None, str, bool] | None:
+    """Match an open value, holding back an unfinished next parameter tag."""
+    pm = partial_param_re.search(raw_args, pos)
+    if pm is None:
+        return None
+    value = pm.group(3)
+    cut = value.find(param_start, value.rfind(">") + 1)
+    if cut >= 0:
+        return pm.group(1), pm.group(2), value[:cut], True
+    return pm.group(1), pm.group(2), value, False
 
 
 def _dsml_arg_converter(
@@ -76,6 +91,7 @@ def _dsml_arg_converter(
     *,
     param_re: re.Pattern = _PARAM_RE,
     partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
+    param_start: str = DSML_PARAM_START,
 ) -> str:
     params: dict[str, object] = {}
 
@@ -93,9 +109,11 @@ def _dsml_arg_converter(
         last_end = m.end()
 
     if partial:
-        pm = partial_param_re.search(raw_args, last_end)
-        if pm:
-            name, is_str, value = pm.group(1), pm.group(2), pm.group(3)
+        open_param = _match_open_param(
+            raw_args, last_end, partial_param_re, param_start
+        )
+        if open_param:
+            name, is_str, value, _ = open_param
             if is_str == "true":
                 params[name] = value
             else:
@@ -103,6 +121,44 @@ def _dsml_arg_converter(
                     params[name] = json.loads(value)
 
     return json.dumps(params, ensure_ascii=False)
+
+
+def _dsml_arg_value_extender(
+    raw_args: str,
+    *,
+    param_re: re.Pattern = _PARAM_RE,
+    partial_param_re: re.Pattern = _PARTIAL_PARAM_RE,
+    param_start: str = DSML_PARAM_START,
+    param_close: str = DSML_PARAM_CLOSE,
+) -> ArgValueExtender | None:
+    # ``arg_structural_chars`` skips every delta without ``>``, so a long
+    # string value would wait for its closing tag. Extend the open trailing
+    # ``string="true"`` value instead. The lexer can flush a held partial
+    # tag as text, so keep a tail to catch a tag split across deltas.
+    names = set()
+    last_end = 0
+    for m in param_re.finditer(raw_args):
+        names.add(m.group(1))
+        last_end = m.end()
+    open_param = _match_open_param(raw_args, last_end, partial_param_re, param_start)
+    if open_param is None:
+        return None
+    name, is_str, _, held_back = open_param
+    if is_str != "true" or name in names or held_back:
+        return None
+
+    keep = max(len(param_start), len(param_close)) - 1
+    tail = raw_args[-keep:]
+
+    def extend(delta: str) -> str | None:
+        nonlocal tail
+        text = tail + delta
+        if param_start in text or param_close in text:
+            return None
+        tail = text[-keep:]
+        return json.dumps(delta, ensure_ascii=False)[1:-1]
+
+    return extend
 
 
 def _unwrap_wrapper_args(
@@ -249,6 +305,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
         },
         arg_converter=_dsml_arg_converter,
         arg_structural_chars=frozenset(">"),
+        arg_value_extender=_dsml_arg_value_extender,
         strip_content_whitespace_with_tools=False,
         tool_args_json=False,
     )

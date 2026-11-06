@@ -14,6 +14,7 @@ import torch
 from packaging import version
 from packaging.version import Version
 from torch.library import Library, infer_schema
+from torch.utils._pytree import tree_map_only
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -56,8 +57,14 @@ TORCH_DTYPE_TO_NUMPY_DTYPE = {
     torch.float32: np.float32,
     torch.float64: np.float64,
     torch.uint8: np.uint8,
+    torch.uint16: np.uint16,
+    torch.uint32: np.uint32,
+    torch.uint64: np.uint64,
+    torch.int8: np.int8,
+    torch.int16: np.int16,
     torch.int32: np.int32,
     torch.int64: np.int64,
+    torch.bool: np.bool_,
 }
 
 
@@ -743,14 +750,15 @@ def weak_ref_tensors(
 ) -> torch.Tensor | list[Any] | tuple[Any] | Any:
     """
     Convenience function to create weak references to tensors,
-    for single tensor, list of tensors or tuple of tensors.
+    for single tensors, nested list/tuple outputs, or IntermediateTensors.
+    Non-tensor leaves are preserved.
     """
     if isinstance(tensors, torch.Tensor):
         return weak_ref_tensor(tensors)
-    if isinstance(tensors, list):
-        return [weak_ref_tensor(t) for t in tensors]
-    if isinstance(tensors, tuple):
-        return tuple(weak_ref_tensor(t) for t in tensors)
+    if isinstance(tensors, (list, tuple)):
+        # Pytrees treat unregistered sequence subclasses as opaque leaves.
+        tensors = list(tensors) if isinstance(tensors, list) else tuple(tensors)
+        return tree_map_only(torch.Tensor, weak_ref_tensor, tensors)
 
     # For IntermediateTensors used in pipeline parallelism
     from vllm.sequence import IntermediateTensors
@@ -760,7 +768,7 @@ def weak_ref_tensors(
             {key: weak_ref_tensor(val) for key, val in tensors.tensors.items()}
         )
         return ret
-    raise ValueError("Invalid type for tensors")
+    raise ValueError(f"Invalid type for tensors: {type(tensors)}")
 
 
 def get_accelerator_view_from_cpu_tensor(cpu_tensor: torch.Tensor) -> torch.Tensor:
